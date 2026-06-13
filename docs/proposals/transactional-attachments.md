@@ -205,16 +205,25 @@ Allowed attachment policy:
 - Allow only these filename extensions and MIME types:
   - `.pdf`: `application/pdf`
   - `.txt`: `text/plain`
+  - `.md`, `.markdown`: `text/markdown`, `text/plain`
   - `.csv`: `text/csv`, `application/csv`
   - `.png`: `image/png`
   - `.jpg`, `.jpeg`: `image/jpeg`
+  - `.gif`: `image/gif`
+  - `.webp`: `image/webp`
   - `.docx`: `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
   - `.xlsx`: `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+  - `.pptx`: `application/vnd.openxmlformats-officedocument.presentationml.presentation`
+  - `.zip`: `application/zip`, `application/x-zip-compressed`
+  - `.mp4`: `video/mp4`
+  - `.mov`: `video/quicktime`
+  - `.webm`: `video/webm`
 - Require valid filename extension.
 - Require filename extension to match the declared content type.
-- Require PDF, PNG, and JPEG magic-number validation.
+- Require PDF, PNG, JPEG, GIF, WebP, ZIP, MP4, MOV, and WebM signature validation.
+- Require TXT, Markdown, and CSV payloads to decode as UTF-8 text.
 - Always reject SES unsupported extensions.
-- Always reject executable/script/archive formats: `.exe`, `.dll`, `.bat`, `.cmd`, `.com`, `.scr`, `.ps1`, `.js`, `.vbs`, `.jar`, `.msi`, `.zip`, `.rar`, `.7z`, `.tar`, `.gz`.
+- Always reject executable/script/archive formats except ZIP: `.exe`, `.dll`, `.bat`, `.cmd`, `.com`, `.scr`, `.ps1`, `.js`, `.vbs`, `.jar`, `.msi`, `.rar`, `.7z`, `.tar`, `.gz`.
 - Reject files whose validated signature contradicts the claimed safe type.
 
 The first end-to-end production validation artifact must be a PDF invoice-style attachment sent through SES.
@@ -381,7 +390,8 @@ These defaults intentionally sit below SES's 40 MB total message limit to leave 
    - Filename sanitization.
    - Extension/MIME allowlist enforcement.
    - Extension denylist aligned with SES unsupported attachment types.
-   - PDF/PNG/JPEG magic-number validation.
+   - Binary signature validation for PDF, PNG, JPEG, GIF, WebP, ZIP, MP4, MOV, and WebM.
+   - UTF-8 validation for TXT, Markdown, and CSV.
    - Size accounting and final MIME size estimation.
    - Idempotent cleanup helpers.
 
