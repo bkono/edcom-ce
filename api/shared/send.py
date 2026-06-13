@@ -707,6 +707,119 @@ def choose_backend(
     return obj, settingsid
 
 
+def possible_backend_types(
+    route: JsonObj,
+    toaddr: str,
+    domaingroups: Dict[str, JsonObj],
+    policies: Dict[str, JsonObj],
+    sinks: Dict[str, JsonObj],
+    mailgun: Dict[str, JsonObj],
+    ses: Dict[str, JsonObj],
+    sparkpost: Dict[str, JsonObj],
+    easylink: Dict[str, JsonObj],
+    smtprelays: Dict[str, JsonObj],
+) -> Set[str]:
+    backend_types: Set[str] = set()
+    domain = toaddr.split("@")[1]
+
+    for rule in route["published"]["rules"]:
+        rule_matches = False
+        if not rule["domaingroup"]:
+            rule_matches = True
+        else:
+            dg = domaingroups.get(rule["domaingroup"], None)
+            if dg is None:
+                continue
+            for dg_domain in dg["domains"].split():
+                if fnmatch(domain, dg_domain):
+                    rule_matches = True
+                    break
+        if not rule_matches:
+            continue
+
+        for split in rule["splits"]:
+            policyid = split.get("policy")
+            if not policyid:
+                continue
+            if policyid in mailgun:
+                backend_types.add("mailgun")
+                continue
+            if policyid in ses:
+                backend_types.add("ses")
+                continue
+            if policyid in sparkpost:
+                backend_types.add("sparkpost")
+                continue
+            if policyid in easylink:
+                backend_types.add("easylink")
+                continue
+            if policyid in smtprelays:
+                backend_types.add("smtprelay")
+                continue
+
+            policy = policies.get(policyid, None)
+            if policy is None or policy.get("published", None) is None:
+                continue
+            published = policy["published"]
+            policy_matches = False
+            for policy_domain in published["domains"].split():
+                if fnmatch(domain, policy_domain):
+                    policy_matches = True
+                    break
+            if not policy_matches:
+                continue
+
+            for sink in published["sinks"]:
+                if sink["sink"] in sinks:
+                    backend_types.add("sink")
+
+    return backend_types
+
+
+def route_backend_types_for_recipient(db: DB, route: JsonObj, toaddr: str) -> Set[str]:
+    domaingroups = {}
+    policies = {}
+    sinks = {}
+    mailgun = {}
+    ses = {}
+    sparkpost = {}
+    easylink = {}
+    smtprelays = {}
+    oldcid = db.get_cid()
+    db.set_cid(route["cid"])
+    try:
+        for dg in db.domaingroups.find():
+            domaingroups[dg["id"]] = dg
+        for p in db.policies.find():
+            policies[p["id"]] = p
+        for s in db.sinks.find():
+            sinks[s["id"]] = s
+        for m in db.mailgun.find():
+            mailgun[m["id"]] = m
+        for s in db.ses.find():
+            ses[s["id"]] = s
+        for s in db.sparkpost.find():
+            sparkpost[s["id"]] = s
+        for s in db.easylink.find():
+            easylink[s["id"]] = s
+        for s in db.smtprelays.find():
+            smtprelays[s["id"]] = s
+        return possible_backend_types(
+            route,
+            toaddr,
+            domaingroups,
+            policies,
+            sinks,
+            mailgun,
+            ses,
+            sparkpost,
+            easylink,
+            smtprelays,
+        )
+    finally:
+        db.set_cid(oldcid)
+
+
 def get_frontend_params(
     db: DB, usercid: str
 ) -> Tuple[bool, str, str, str, str, str, bool]:

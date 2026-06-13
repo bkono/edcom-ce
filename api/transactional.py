@@ -30,6 +30,7 @@ from .shared.send import (
     check_send_limit,
     check_test_limit,
     load_domain_throttles,
+    route_backend_types_for_recipient,
 )
 from .shared.attachments import (
     AttachmentError,
@@ -695,6 +696,20 @@ class Send(object):
                 description="The 'to' address specified is invalid",
             )
         domain = addr.split("@")[1]
+
+        if attachment_uploads:
+            route = db.routes.get(doc["route"])
+            if route is None or "published" not in route:
+                raise falcon.HTTPForbidden()
+            backend_types = route_backend_types_for_recipient(db, route, addr.lower())
+            if not backend_types or backend_types != {"ses"}:
+                raise falcon.HTTPBadRequest(
+                    title="Unsupported postal route",
+                    description=(
+                        "Transactional attachments are only supported for routes "
+                        "that resolve exclusively to SES"
+                    ),
+                )
 
         attachment_storage = None
         attachment_manifests = []
