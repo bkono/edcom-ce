@@ -37,17 +37,28 @@ Snapshot location: `/root/edcom-pre-fork-20260613T174413Z`
 
 ## First Fork Migration
 
-- [ ] Confirm the first fork GitHub Release exists and has
+- [x] Confirm the first fork GitHub Release exists and has
   `edcom-install-amd64.tgz` plus `checksums.txt`.
-- [ ] Replace `/root/edcom-install/upgrade.sh` with the fork-owned updater.
+- [x] Replace `/root/edcom-install/upgrade.sh` with the fork-owned updater.
 - [x] Disable the legacy Keygen cron entry until a fork release is available.
-- [ ] Run `cd /root/edcom-install && ./upgrade.sh --check-only`.
-- [ ] Run `cd /root/edcom-install && ./upgrade.sh --no-prompt` once the
+- [x] Run `cd /root/edcom-install && ./upgrade.sh --check-only`.
+- [x] Run `cd /root/edcom-install && ./upgrade.sh --no-prompt` once the
   latest fork release is ready.
-- [ ] Verify `config/VERSION`, Docker image creation times, service health, and
+- [x] Verify `config/VERSION`, Docker image creation times, service health, and
   login path after restart.
-- [ ] Install daily cron:
+- [x] Install daily cron:
   `17 3 * * * cd /root/edcom-install && ./upgrade.sh --no-prompt >> /var/log/edcom-upgrade.log 2>&1`
+
+Migration completed against release `v1.20260613.1754`. The first restart hit a
+one-time compose project-name conflict because the fork compose declares
+`name: edcom` while the commercial install used the directory-derived project
+name. Recovery used `/root/edcom-install/docker-compose.pre-fork-migration.yml`
+to stop/remove the old project containers, then `docker compose up -d` with the
+fork compose.
+
+Production-specific compose behavior is preserved in
+`/root/edcom-install/docker-compose.override.yml`: machine-id mounts,
+`edcom-tasks` container name, and the `segments` worker.
 
 ## Decision Ledger
 
