@@ -48,6 +48,12 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Build base images
+        run: |
+          set -euo pipefail
+          dev/build_python_base.sh
+          dev/build_node_base.sh
+
       - name: Build install archives
         env:
           BUILD: ${{ needs.version.outputs.build }}
