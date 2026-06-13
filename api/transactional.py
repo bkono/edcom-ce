@@ -508,6 +508,37 @@ def parse_json_send_request(
     return doc, uploads
 
 
+def read_multipart_part_bytes(part: Any, limit: int) -> bytes:
+    stream = getattr(part, "stream", None)
+    if stream is not None:
+        return read_limited_stream(stream, limit)
+    data = getattr(part, "data", None)
+    if data is None:
+        data = getattr(part, "text", "")
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    if len(data) > limit:
+        raise AttachmentError("Attachment exceeds maximum file size")
+    return data
+
+
+def read_multipart_payload(part: Any, config: Any) -> str:
+    try:
+        data = read_multipart_part_bytes(part, config.json_body_max_bytes)
+    except AttachmentError:
+        raise falcon.HTTPBadRequest(
+            title="Request too large",
+            description="Attachment JSON request body exceeds the maximum size",
+        )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise falcon.HTTPBadRequest(
+            title="Malformed payload",
+            description="payload must be a valid UTF-8 JSON document",
+        )
+
+
 def parse_multipart_send_request(
     req: falcon.Request,
     config: Any,
@@ -523,7 +554,7 @@ def parse_multipart_send_request(
                         title="Invalid multipart request",
                         description="Only one payload field is allowed",
                     )
-                payload = part.text
+                payload = read_multipart_payload(part, config)
                 continue
             if part.name != "attachment":
                 raise falcon.HTTPBadRequest(
@@ -533,15 +564,7 @@ def parse_multipart_send_request(
 
             filename = getattr(part, "filename", "") or ""
             content_type = getattr(part, "content_type", "") or ""
-            stream = getattr(part, "stream", None)
-            if stream is None:
-                data = getattr(part, "data", b"")
-                if isinstance(data, str):
-                    data = data.encode("utf-8")
-                if len(data) > config.max_file_bytes:
-                    raise AttachmentError("Attachment exceeds maximum file size")
-            else:
-                data = read_limited_stream(stream, config.max_file_bytes)
+            data = read_multipart_part_bytes(part, config.max_file_bytes)
             uploads.append(
                 AttachmentUpload(
                     filename=filename,

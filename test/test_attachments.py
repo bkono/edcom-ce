@@ -1,9 +1,19 @@
 import base64
 from email.parser import BytesParser
 from email.policy import default
+import json
 import os
 import tempfile
 import unittest
+
+try:
+    import falcon
+    from falcon import testing
+    from api.transactional import parse_multipart_send_request
+except ModuleNotFoundError:
+    falcon = None
+    testing = None
+    parse_multipart_send_request = None
 
 from api.shared.attachments import (
     AttachmentConfig,
@@ -17,6 +27,25 @@ from api.shared.attachments import (
     store_attachments,
     validate_attachment_collection,
 )
+
+
+def multipart_field(boundary, name, value, content_type=None):
+    headers = [
+        "--%s" % boundary,
+        'Content-Disposition: form-data; name="%s"' % name,
+    ]
+    if content_type:
+        headers.append("Content-Type: %s" % content_type)
+    return ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8") + value + b"\r\n"
+
+
+def multipart_file(boundary, name, filename, content_type, value):
+    headers = [
+        "--%s" % boundary,
+        'Content-Disposition: form-data; name="%s"; filename="%s"' % (name, filename),
+        "Content-Type: %s" % content_type,
+    ]
+    return ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8") + value + b"\r\n"
 
 
 def config(**overrides):
@@ -152,6 +181,64 @@ class TestAttachments(unittest.TestCase):
             self.assertEqual(len(attachments), 1)
             self.assertEqual(attachments[0].get_filename(), "invoice.pdf")
             self.assertEqual(attachments[0].get_content_type(), "application/pdf")
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_parses_falcon_streamed_multipart_payload_and_attachment(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p>Attached.</p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "invoice.pdf",
+                    "application/pdf",
+                    b"%PDF-1.7\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        class Resource:
+            def on_post(self, req, resp):
+                doc, uploads = parse_multipart_send_request(req, config())
+                resp.media = {
+                    "subject": doc["subject"],
+                    "filename": uploads[0].filename,
+                    "content_type": uploads[0].content_type,
+                    "size": len(uploads[0].data),
+                }
+
+        app = falcon.App()
+        app.add_route("/send", Resource())
+        client = testing.TestClient(app)
+        resp = client.simulate_post(
+            "/send",
+            body=body,
+            headers={"content-type": "multipart/form-data; boundary=%s" % boundary},
+        )
+
+        self.assertEqual(resp.status, "200 OK")
+        self.assertEqual(
+            resp.json,
+            {
+                "subject": "Invoice",
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "size": 9,
+            },
+        )
 
 
 if __name__ == "__main__":
