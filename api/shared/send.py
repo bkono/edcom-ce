@@ -1558,6 +1558,12 @@ def do_ses_send(
                 )
                 try:
                     if attachments and attachment_storage is not None:
+                        log.info(
+                            "sending SES raw transactional message with %s attachments cid=%s campid=%s",
+                            len(attachments),
+                            campcid,
+                            campid,
+                        )
                         raw_message = build_raw_mime_message(
                             frm,
                             replyto,

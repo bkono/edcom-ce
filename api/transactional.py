@@ -735,6 +735,12 @@ class Send(object):
                     raise falcon.HTTPBadRequest(
                         title="Invalid attachment", description=str(e)
                     )
+                log.info(
+                    "accepted %s transactional attachments for cid=%s msgid=%s",
+                    len(attachment_manifests),
+                    mycid,
+                    txnmsgid,
+                )
 
             db.execute(
                 "insert into txnqueue (cid, route, domain, data) values (%s, %s, %s, %s)",
@@ -1235,6 +1241,7 @@ class RecentTags(object):
 
 
 CHECK_TXNS_LOCK = 38660663
+TXN_ATTACHMENT_CLEANUP_LOCK = 38660664
 
 
 def check_txns() -> None:
@@ -1299,6 +1306,82 @@ def check_txns() -> None:
                                     run_task(send_txn, company, data)
                     except:
                         log.exception("error")
+        except:
+            log.exception("error")
+
+
+def cleanup_expired_txn_attachments() -> None:
+    with open_db() as db:
+        try:
+            with db.transaction():
+                if not db.single(
+                    f"select pg_try_advisory_xact_lock({TXN_ATTACHMENT_CLEANUP_LOCK})"
+                ):
+                    return
+
+                now = datetime.utcnow()
+                for rowid, cid, data in list(
+                    db.execute(
+                        """
+                    select id, cid, data from txnqueue
+                    where data->'attachments' is not null
+                """
+                    )
+                ):
+                    attachments = data.get("attachments") or []
+                    if not attachments:
+                        continue
+
+                    expired = False
+                    for attachment in attachments:
+                        expires_at = attachment.get("expires_at")
+                        if not expires_at:
+                            expired = True
+                            break
+                        try:
+                            expires_dt = (
+                                dateutil.parser.parse(expires_at)
+                                .astimezone(tzutc())
+                                .replace(tzinfo=None)
+                            )
+                        except:
+                            expired = True
+                            break
+                        if expires_dt <= now:
+                            expired = True
+                            break
+
+                    if not expired:
+                        continue
+
+                    delete_attachments(
+                        build_attachment_storage(get_attachment_config()),
+                        attachments,
+                    )
+                    db.execute(
+                        "delete from txnqueue where cid = %s and id = %s",
+                        cid,
+                        rowid,
+                    )
+                    campid = data.get("campid")
+                    txnmsgid = None
+                    if campid is not None:
+                        txnmsgid, _ = parse_txnid(campid)
+                    data["event"] = "Error"
+                    data["error"] = "Transactional attachments expired before send"
+                    db.execute(
+                        "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+                        shortuuid.uuid(),
+                        cid,
+                        datetime.utcnow(),
+                        txnmsgid,
+                        data,
+                    )
+                    log.info(
+                        "expired transactional attachments for cid=%s queue_id=%s",
+                        cid,
+                        rowid,
+                    )
         except:
             log.exception("error")
 
