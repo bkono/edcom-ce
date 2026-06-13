@@ -1,5 +1,5 @@
 # EmailDelivery.com Community Edition
-[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/emaildelivery/edcom-ce/blob/main/LICENSE)
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/bkono/edcom-ce/blob/main/LICENSE)
 
 **EmailDelivery.com Community Edition** is an open-source fork of the commercial email marketing platform [EmailDelivery.com](https://emaildelivery.com). 
 
@@ -53,7 +53,7 @@ This repository is intended for developers who want to contribute to the platfor
 
 Clone the repository:
 ```bash
-git clone https://github.com/emaildelivery/edcom-ce.git
+git clone https://github.com/bkono/edcom-ce.git
 cd edcom-ce
 ```
 
@@ -174,7 +174,7 @@ In production:
 - Nginx listens on ports **80** and **443** (if SSL is configured)
 - Nginx proxies API requests to the application backend
 
-For production builds, see the files in `.build/` created by the scripts in `dev` and consult the project [README](https://github.com/emaildelivery/edcom-ce/blob/main/README.md) for deploying Docker images.
+For production builds, see the files in `.build/` created by the scripts in `dev` and consult the project [README](https://github.com/bkono/edcom-ce/blob/main/README.md) for deploying Docker images.
 
 ---
 
