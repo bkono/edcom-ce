@@ -22,12 +22,15 @@ not be reintroduced.
 
 ## Commit Workflow
 
-- Prefer small, atomic commits for completed behavior-scoped work.
+- Small, atomic commits are mandatory for all completed work.
+- Committing completed work is mandatory. Do not leave completed changes only
+  in the working tree.
+- Each commit must contain one coherent behavior-scoped change. Split docs, CI,
+  updater, build, server-handoff, and application changes into separate commits.
 - Use conventional commit messages, for example:
   `feat(updater): ...`, `ci(release): ...`, `build(release): ...`,
   `docs(update): ...`.
-- Do not bundle unrelated docs, CI, updater, build, and server-handoff changes
-  into one commit.
+- Do not create broad "misc" commits or combine unrelated concerns.
 
 ## Quality Gate
 
