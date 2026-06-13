@@ -8,3 +8,4 @@ machine-id
 .env
 .build
 test/logs
+test/smtpcert

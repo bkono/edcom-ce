@@ -98,6 +98,16 @@ def post(path, body, content_type):
         raise SystemExit("HTTP %s: %s" % (e.code, text))
 
 
+def run_after_send(label):
+    command = optional_env("EDCOM_AFTER_SEND_COMMAND")
+    if not command:
+        return
+    print("Running post-send command for %s..." % label)
+    result = subprocess.run(command, shell=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit("Post-send command failed for %s" % label)
+
+
 def send_json():
     payload = build_payload("Transactional JSON attachment integration test")
     payload["attachments"] = [
@@ -113,6 +123,7 @@ def send_json():
         "application/json",
     )
     print("JSON attachment request accepted")
+    run_after_send("json")
 
 
 def multipart_field(boundary, name, value, content_type=None):
@@ -161,6 +172,7 @@ def send_multipart():
         "multipart/form-data; boundary=%s" % boundary,
     )
     print("Multipart attachment request accepted")
+    run_after_send("multipart")
 
 
 def send_smtp():
@@ -199,6 +211,41 @@ def send_smtp():
             smtp.ehlo()
         smtp.send_message(msg)
     print("SMTP attachment message accepted")
+    run_after_send("smtp")
+
+
+def assert_s3_prefix_empty():
+    bucket = required_env("EDCOM_ATTACHMENT_BUCKET")
+    prefix = required_env("EDCOM_ATTACHMENT_PREFIX")
+    endpoint = optional_env("EDCOM_ATTACHMENT_ENDPOINT_URL")
+    region = optional_env("EDCOM_ATTACHMENT_REGION", optional_env("EDCOM_SES_REGION"))
+    cmd = [
+        "aws",
+        "s3api",
+        "list-objects-v2",
+        "--bucket",
+        bucket,
+        "--prefix",
+        prefix,
+        "--query",
+        "length(Contents || `[]`)",
+        "--output",
+        "text",
+    ]
+    if region:
+        cmd.extend(["--region", region])
+    if endpoint:
+        cmd.extend(["--endpoint-url", endpoint])
+    result = subprocess.run(cmd, check=False, text=True, capture_output=True)
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or result.stdout.strip())
+    count = int(result.stdout.strip() or "0")
+    if count != 0:
+        raise SystemExit(
+            "Attachment prefix %s still has %s objects after send drain"
+            % (prefix, count)
+        )
+    print("Attachment prefix is empty after send drain: %s" % prefix)
 
 
 def check_lifecycle():
@@ -231,6 +278,7 @@ def main():
     parser.add_argument("--skip-multipart", action="store_true")
     parser.add_argument("--skip-smtp", action="store_true")
     parser.add_argument("--check-lifecycle", action="store_true")
+    parser.add_argument("--assert-s3-prefix-empty", action="store_true")
     args = parser.parse_args()
 
     if args.check_lifecycle:
@@ -241,6 +289,8 @@ def main():
         send_multipart()
     if not args.skip_smtp:
         send_smtp()
+    if args.assert_s3_prefix_empty:
+        assert_s3_prefix_empty()
 
     print("Confirm the recipient inbox received all requested PDF attachments.")
 
