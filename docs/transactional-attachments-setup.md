@@ -217,3 +217,48 @@ sent through SES by each supported ingress path:
 2. API JSON base64.
 3. SMTP relay MIME.
 
+## Live Integration Runner
+
+Use the integration runner before opening the PR and again after deployment:
+
+```bash
+export EDCOM_BASE_URL="https://esp.yourdomain.com"
+export EDCOM_API_KEY="customer-api-key"
+export EDCOM_FROM_EMAIL="billing@yourdomain.com"
+export EDCOM_TO_EMAIL="recipient@example.com"
+export EDCOM_ROUTE_ID="ses-only-route-id"
+export EDCOM_SMTP_HOST="esp.yourdomain.com"
+export EDCOM_SMTP_PORT="587"
+export EDCOM_SMTP_STARTTLS="true"
+
+python3 scripts/transactional_attachments_integration.py
+```
+
+The runner sends:
+
+- API JSON base64 attachment request.
+- API multipart attachment request.
+- SMTP relay MIME attachment request.
+
+It uses a generated invoice-style PDF attachment and expects the route to resolve
+exclusively to SES.
+
+To also inspect the lifecycle rule with the already configured `aws` CLI:
+
+```bash
+export EDCOM_ATTACHMENT_BUCKET="your-s3-or-r2-bucket"
+export EDCOM_ATTACHMENT_PREFIX="attachments/txn/"
+export EDCOM_ATTACHMENT_ENDPOINT_URL="https://ACCOUNT_ID.r2.cloudflarestorage.com"
+
+python3 scripts/transactional_attachments_integration.py \
+  --check-lifecycle \
+  --skip-json \
+  --skip-multipart \
+  --skip-smtp
+```
+
+For AWS S3, omit `EDCOM_ATTACHMENT_ENDPOINT_URL`.
+
+The runner verifies request acceptance and lifecycle configuration visibility. It
+does not log into the recipient mailbox; manually confirm the inbox received the
+PDF attachment for each enabled ingress path.
