@@ -1,4 +1,6 @@
 import base64
+from email.parser import BytesParser
+from email.policy import default
 import os
 import tempfile
 import unittest
@@ -9,6 +11,7 @@ from api.shared.attachments import (
     AttachmentError,
     AttachmentUpload,
     LocalAttachmentStorage,
+    build_raw_mime_message,
     decode_json_attachment,
     delete_attachments,
     store_attachments,
@@ -120,6 +123,35 @@ class TestAttachments(unittest.TestCase):
 
             delete_attachments(storage, manifests)
             self.assertFalse(os.path.exists(os.path.join(root, manifest["key"])))
+
+    def test_builds_raw_mime_with_attachment(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = config(local_path=root)
+            storage = LocalAttachmentStorage(root)
+            manifests = store_attachments(
+                storage,
+                cfg,
+                "companyid",
+                "messageid",
+                [AttachmentUpload("invoice.pdf", "application/pdf", b"%PDF-1.7\n")],
+            )
+
+            raw = build_raw_mime_message(
+                "Billing <billing@example.com>",
+                "support@example.com",
+                "Customer <customer@example.com>",
+                "Invoice",
+                "<p>Attached.</p>",
+                storage,
+                manifests,
+            )
+            message = BytesParser(policy=default).parsebytes(raw)
+            attachments = list(message.iter_attachments())
+
+            self.assertEqual(message["Subject"], "Invoice")
+            self.assertEqual(len(attachments), 1)
+            self.assertEqual(attachments[0].get_filename(), "invoice.pdf")
+            self.assertEqual(attachments[0].get_content_type(), "application/pdf")
 
 
 if __name__ == "__main__":

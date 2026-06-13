@@ -790,6 +790,7 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
     with open_db() as db:
         mycid = None
         txnmsgid = None
+        attachment_manifests = data.get("attachments") or []
 
         try:
             campid = data.get("campid")
@@ -936,6 +937,7 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 subject,
                 campid=campid,
                 toname=data["toname"],
+                attachments=attachment_manifests,
                 raise_err=True,
             )
 
@@ -973,6 +975,15 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                     )
                 except:
                     log.exception("error")
+        finally:
+            if attachment_manifests:
+                try:
+                    delete_attachments(
+                        build_attachment_storage(get_attachment_config()),
+                        attachment_manifests,
+                    )
+                except:
+                    log.exception("error cleaning up transactional attachments")
 
 
 @tasks.task(priority=HIGH_PRIORITY)

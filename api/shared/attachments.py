@@ -10,6 +10,8 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from email.message import EmailMessage
+from email.policy import SMTP
 from io import BytesIO
 from typing import BinaryIO, Dict, Iterator, List, Protocol, TypedDict
 
@@ -725,6 +727,52 @@ def delete_attachments(
             storage.delete(manifest)
         except Exception:
             log.exception("error deleting transactional attachment %s", manifest["id"])
+
+
+def read_attachment_bytes(
+    storage: AttachmentStorage, manifest: AttachmentManifest
+) -> bytes:
+    with storage.open_read(manifest) as fp:
+        data = fp.read()
+    if len(data) != manifest["size"]:
+        raise AttachmentError("Attachment size changed in storage")
+    if hashlib.sha256(data).hexdigest() != manifest["sha256"]:
+        raise AttachmentError("Attachment checksum changed in storage")
+    return data
+
+
+def build_raw_mime_message(
+    frm: str,
+    replyto: str,
+    to: str,
+    subject: str,
+    html: str,
+    storage: AttachmentStorage,
+    attachments: List[AttachmentManifest],
+) -> bytes:
+    msg = EmailMessage(policy=SMTP)
+    msg["From"] = frm
+    msg["To"] = to
+    if replyto:
+        msg["Reply-To"] = replyto
+    msg["Subject"] = subject
+    msg.set_content("This message contains an HTML body and attachments.")
+    msg.add_alternative(html, subtype="html")
+
+    for manifest in attachments:
+        data = read_attachment_bytes(storage, manifest)
+        maintype, subtype = manifest["content_type"].split("/", 1)
+        kwargs = {
+            "maintype": maintype,
+            "subtype": subtype,
+            "filename": manifest["filename"],
+            "disposition": manifest["disposition"],
+        }
+        if manifest.get("content_id"):
+            kwargs["cid"] = manifest["content_id"]
+        msg.add_attachment(data, **kwargs)
+
+    return msg.as_bytes()
 
 
 def decode_json_attachment(item: Dict[str, str], config: AttachmentConfig) -> AttachmentUpload:
