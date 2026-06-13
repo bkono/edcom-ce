@@ -5,24 +5,28 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 try:
     import falcon
     from falcon import testing
-    from api.shared.send import possible_backend_types
+    from api.shared.send import do_ses_send_task, possible_backend_types
     from api.transactional import parse_multipart_send_request
 except ModuleNotFoundError:
     falcon = None
     testing = None
+    do_ses_send_task = None
     possible_backend_types = None
     parse_multipart_send_request = None
 
 from api.shared.attachments import (
+    ATTACHMENT_LIFECYCLE_RULE_ID,
     AttachmentConfig,
     AttachmentDisabledError,
     AttachmentError,
     AttachmentUpload,
     LocalAttachmentStorage,
+    S3AttachmentStorage,
     build_raw_mime_message,
     decode_json_attachment,
     delete_attachments,
@@ -73,6 +77,24 @@ def config(**overrides):
     }
     values.update(overrides)
     return AttachmentConfig(**values)
+
+
+class NoSuchLifecycleConfiguration(Exception):
+    response = {"Error": {"Code": "NoSuchLifecycleConfiguration"}}
+
+
+class FakeS3Client:
+    def __init__(self, lifecycle=None):
+        self.lifecycle = lifecycle
+        self.put_lifecycle = None
+
+    def get_bucket_lifecycle_configuration(self, Bucket):
+        if self.lifecycle is None:
+            raise NoSuchLifecycleConfiguration()
+        return self.lifecycle
+
+    def put_bucket_lifecycle_configuration(self, Bucket, LifecycleConfiguration):
+        self.put_lifecycle = LifecycleConfiguration
 
 
 class TestAttachments(unittest.TestCase):
@@ -183,6 +205,80 @@ class TestAttachments(unittest.TestCase):
             self.assertEqual(len(attachments), 1)
             self.assertEqual(attachments[0].get_filename(), "invoice.pdf")
             self.assertEqual(attachments[0].get_content_type(), "application/pdf")
+
+    def test_s3_lifecycle_preserves_existing_bucket_rules(self):
+        client = FakeS3Client(
+            {
+                "Rules": [
+                    {
+                        "ID": "keep-other-prefix",
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": "other/"},
+                        "Expiration": {"Days": 30},
+                    },
+                    {
+                        "ID": ATTACHMENT_LIFECYCLE_RULE_ID,
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": "old/"},
+                        "Expiration": {"Days": 9},
+                    },
+                ]
+            }
+        )
+        storage = S3AttachmentStorage.__new__(S3AttachmentStorage)
+        storage.bucket = "bucket"
+        storage.client = client
+
+        storage.configure_lifecycle("attachments/txn/", 2, 1)
+
+        rules = client.put_lifecycle["Rules"]
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(rules[0]["ID"], "keep-other-prefix")
+        self.assertEqual(rules[0]["Filter"], {"Prefix": "other/"})
+        self.assertEqual(rules[1]["ID"], ATTACHMENT_LIFECYCLE_RULE_ID)
+        self.assertEqual(rules[1]["Filter"], {"Prefix": "attachments/txn/"})
+        self.assertEqual(rules[1]["Expiration"], {"Days": 2})
+
+    def test_s3_lifecycle_creates_attachment_rule_when_bucket_has_no_lifecycle(self):
+        client = FakeS3Client()
+        storage = S3AttachmentStorage.__new__(S3AttachmentStorage)
+        storage.bucket = "bucket"
+        storage.client = client
+
+        storage.configure_lifecycle("attachments/txn/", 2, 1)
+
+        self.assertEqual(
+            client.put_lifecycle["Rules"][0]["ID"],
+            ATTACHMENT_LIFECYCLE_RULE_ID,
+        )
+
+    @unittest.skipIf(do_ses_send_task is None, "send dependencies are not installed")
+    def test_ses_task_accepts_pre_attachment_positional_args(self):
+        captured = {}
+
+        def fake_do_ses_send(*args):
+            captured["args"] = args
+
+        task_callable = getattr(do_ses_send_task, "run", do_ses_send_task)
+        with patch("api.shared.send.do_ses_send", fake_do_ses_send):
+            task_callable(
+                {"id": "ses"},
+                "from@example.com",
+                "reply@example.com",
+                "campid",
+                "campcid",
+                False,
+                [],
+                None,
+                {},
+                False,
+                "htmlkey",
+                "subject",
+                True,
+            )
+
+        self.assertIs(captured["args"][-2], True)
+        self.assertIsNone(captured["args"][-1])
 
     @unittest.skipIf(falcon is None, "falcon is not installed")
     def test_parses_falcon_streamed_multipart_payload_and_attachment(self):

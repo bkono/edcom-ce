@@ -16,6 +16,7 @@ from io import BytesIO
 from typing import BinaryIO, Dict, Iterator, List, Protocol, TypedDict
 
 log = logging.getLogger(__name__)
+ATTACHMENT_LIFECYCLE_RULE_ID = "edcom-transactional-attachment-expiration"
 
 
 class AttachmentError(ValueError):
@@ -584,21 +585,36 @@ class S3AttachmentStorage:
     def configure_lifecycle(
         self, prefix: str, expiration_days: int, abort_multipart_days: int
     ) -> None:
+        rules = []
+        try:
+            lifecycle = self.client.get_bucket_lifecycle_configuration(
+                Bucket=self.bucket
+            )
+            rules = lifecycle.get("Rules", [])
+        except Exception as e:
+            error = getattr(e, "response", {}).get("Error", {})
+            if error.get("Code") != "NoSuchLifecycleConfiguration":
+                raise
+
+        rules = [
+            rule
+            for rule in rules
+            if rule.get("ID") != ATTACHMENT_LIFECYCLE_RULE_ID
+        ]
+        rules.append(
+            {
+                "ID": ATTACHMENT_LIFECYCLE_RULE_ID,
+                "Status": "Enabled",
+                "Filter": {"Prefix": prefix},
+                "Expiration": {"Days": expiration_days},
+                "AbortIncompleteMultipartUpload": {
+                    "DaysAfterInitiation": abort_multipart_days
+                },
+            }
+        )
         self.client.put_bucket_lifecycle_configuration(
             Bucket=self.bucket,
-            LifecycleConfiguration={
-                "Rules": [
-                    {
-                        "ID": "edcom-transactional-attachment-expiration",
-                        "Status": "Enabled",
-                        "Filter": {"Prefix": prefix},
-                        "Expiration": {"Days": expiration_days},
-                        "AbortIncompleteMultipartUpload": {
-                            "DaysAfterInitiation": abort_multipart_days
-                        },
-                    }
-                ]
-            },
+            LifecycleConfiguration={"Rules": rules},
         )
 
     def healthcheck(self, prefix: str) -> None:

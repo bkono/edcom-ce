@@ -1441,8 +1441,8 @@ def do_ses_send_task(
     write_err: bool,
     htmlkey: str,
     subject: str,
-    attachments: List[AttachmentManifest] | None,
     raise_err: bool,
+    attachments: List[AttachmentManifest] | None = None,
 ) -> None:
     do_ses_send(
         ses,
@@ -1457,8 +1457,8 @@ def do_ses_send_task(
         write_err,
         htmlkey,
         subject,
-        attachments,
         raise_err,
+        attachments,
     )
 
 
@@ -1475,8 +1475,8 @@ def do_ses_send(
     write_err: bool,
     htmlkey: str,
     subject: str,
-    attachments: List[AttachmentManifest] | None,
     raise_err: bool,
+    attachments: List[AttachmentManifest] | None = None,
 ) -> None:
     stream = None
     try:
@@ -2946,8 +2946,8 @@ def ses_send(
             write_err,
             htmlkey,
             subject,
-            attachments,
             raise_err,
+            attachments,
         )
     else:
         if recips is not None:
@@ -2966,8 +2966,8 @@ def ses_send(
             write_err,
             htmlkey,
             subject,
-            attachments,
             raise_err,
+            attachments,
         )
 
 
