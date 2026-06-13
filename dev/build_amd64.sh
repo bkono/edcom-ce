@@ -7,7 +7,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 cd "$SCRIPT_DIR/.."
 
 PLATFORM=linux/amd64
-BUILD=$(date +1.%Y%m%d.%H%M)
+BUILD=${BUILD:-$(date -u +1.%Y%m%d.%H%M)}
 
 echo "VERSION = '$BUILD'" > api/shared/version.py
 
@@ -39,7 +39,7 @@ chmod +x .build/velocity-install/load_images.sh
 
 mkdir .build/edcom-install/config
 mkdir .build/edcom-install/config/linkcerts
-echo $BUILD > .build/edcom-install/config/VERSION
+echo "$BUILD" > .build/edcom-install/config/VERSION
 cp config/edcom.defaults.json .build/edcom-install/config/edcom.defaults.json
 cp config/nginx.server.conf .build/edcom-install/config/nginx.server.conf
 cp config/nginx.ssl.server.conf .build/edcom-install/config/nginx.ssl.server.conf
@@ -52,6 +52,7 @@ cp reset_password.sh .build/edcom-install
 cp change_username.sh .build/edcom-install
 cp convert_to_ssl.sh .build/edcom-install
 cp update_domain.sh .build/edcom-install
+cp upgrade.sh .build/edcom-install
 cp restart.sh .build/edcom-install
 cp ez_setup.sh .build/edcom-install
 cp install_docker_on_ubuntu.sh .build/edcom-install
@@ -85,7 +86,7 @@ Enable Beefree by putting your EmailDelivery.com
 commercial license key in config/commercial_license.key
 and running ./restart.sh
 
-https://github.com/emaildelivery/edcom-ce 
+https://github.com/bkono/edcom-ce
 https://docs.emaildelivery.com/docs/introduction/getting-ready-to-send
 
 
@@ -98,7 +99,7 @@ mkdir .build/velocity-install/conf/linkcerts
 mkdir -p .build/velocity-install/conf/letsencrypt-challenge/.well-known/acme-challenge
 mkdir .build/velocity-install/logs
 mkdir .build/velocity-install/mail
-echo $BUILD > .build/velocity-install/VERSION
+echo "$BUILD" > .build/velocity-install/VERSION
 cd .build/velocity-install
 ln -s conf config
 cd ../..
@@ -114,7 +115,7 @@ EmailDelivery.com Velocity MTA README
 Community Edition
 ---------------------------------
 
-https://github.com/emaildelivery/edcom-ce 
+https://github.com/bkono/edcom-ce
 https://docs.emaildelivery.com/docs/what-you-need-to-know-before-you-install-velocity-mta
 https://docs.emaildelivery.com/docs/velocity-mta-basics/getting-ready-to-send
 https://docs.emaildelivery.com/docs/faq/velocity-mta-faq
@@ -126,7 +127,7 @@ docker image build . -f services/api.Dockerfile --tag edcom/api:latest --platfor
 docker image build smtprelay --tag edcom/smtprelay:latest --platform $PLATFORM
 docker image build screenshot --tag edcom/screenshot:latest --platform $PLATFORM
 docker image build . -f services/client-build.Dockerfile --tag edcom/client-build:latest --platform $PLATFORM
-docker run --rm --platform $PLATFORM -v $PWD/client/src:/client/src -v $PWD/client/public:/client/public -v $PWD/client/build:/client/build edcom/client-build:latest
+docker run --rm --platform "$PLATFORM" -v "$PWD/client/src:/client/src" -v "$PWD/client/public:/client/public" -v "$PWD/client/build:/client/build" edcom/client-build:latest
 docker image build . -f services/proxy.Dockerfile --tag edcom/proxy:latest --platform $PLATFORM
 docker image build velocity --tag edcom/velocity:latest --platform $PLATFORM
 
@@ -142,10 +143,9 @@ sudo chown 70:70 .build/edcom-install/data/logs/postgres
 sudo chown -R 0:0 .build/velocity-install
 
 cd .build
-tar -zcvf edcom-install.tgz edcom-install
-tar -zcvf velocity-install.tgz velocity-install
+tar -zcvf edcom-install-amd64.tgz edcom-install
+tar -zcvf velocity-install-amd64.tgz velocity-install
 cd ..
 
-sudo chown -R $(id -u):$(id -g) .build/edcom-install
-sudo chown -R $(id -u):$(id -g) .build/velocity-install
-
+sudo chown -R "$(id -u):$(id -g)" .build/edcom-install
+sudo chown -R "$(id -u):$(id -g)" .build/velocity-install
