@@ -41,6 +41,7 @@ from .shared.attachments import (
     get_attachment_config,
     read_limited_stream,
     store_attachments,
+    validate_attachment_collection,
 )
 from .shared.db import json_iter, open_db, JsonObj
 from .shared.tasks import tasks, LOW_PRIORITY, HIGH_PRIORITY
@@ -508,18 +509,23 @@ def parse_json_send_request(
     return doc, uploads
 
 
-def read_multipart_part_bytes(part: Any, limit: int) -> bytes:
+def read_multipart_part_bytes(
+    part: Any, limit: int, limit_message: str = "Attachment exceeds maximum file size"
+) -> bytes:
     stream = getattr(part, "stream", None)
-    if stream is not None:
-        return read_limited_stream(stream, limit)
-    data = getattr(part, "data", None)
-    if data is None:
-        data = getattr(part, "text", "")
-    if isinstance(data, str):
-        data = data.encode("utf-8")
-    if len(data) > limit:
-        raise AttachmentError("Attachment exceeds maximum file size")
-    return data
+    try:
+        if stream is not None:
+            return read_limited_stream(stream, limit)
+        data = getattr(part, "data", None)
+        if data is None:
+            data = getattr(part, "text", "")
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if len(data) > limit:
+            raise AttachmentError()
+        return data
+    except AttachmentError:
+        raise AttachmentError(limit_message)
 
 
 def read_multipart_payload(part: Any, config: Any) -> str:
@@ -545,6 +551,7 @@ def parse_multipart_send_request(
 ) -> Tuple[JsonObj, List[AttachmentUpload]]:
     payload = None
     uploads = []
+    total_attachment_bytes = 0
     try:
         media = req.get_media()
         for part in media:
@@ -562,9 +569,19 @@ def parse_multipart_send_request(
                     description="Only payload and attachment fields are allowed",
                 )
 
+            if len(uploads) >= config.max_count:
+                raise AttachmentError("Too many attachments")
+            remaining_total = config.max_total_bytes - total_attachment_bytes
+            if remaining_total <= 0:
+                raise AttachmentError("Attachments exceed maximum total size")
             filename = getattr(part, "filename", "") or ""
             content_type = getattr(part, "content_type", "") or ""
-            data = read_multipart_part_bytes(part, config.max_file_bytes)
+            data = read_multipart_part_bytes(
+                part,
+                min(config.max_file_bytes, remaining_total),
+                "Attachments exceed maximum total size",
+            )
+            total_attachment_bytes += len(data)
             uploads.append(
                 AttachmentUpload(
                     filename=filename,
@@ -733,6 +750,19 @@ class Send(object):
                         "that resolve exclusively to SES"
                     ),
                 )
+            attachment_config = get_attachment_config()
+            try:
+                validate_attachment_collection(
+                    attachment_uploads,
+                    attachment_config,
+                    doc.get("body", ""),
+                )
+            except AttachmentError as e:
+                raise falcon.HTTPBadRequest(
+                    title="Invalid attachment", description=str(e)
+                )
+        else:
+            attachment_config = None
 
         attachment_storage = None
         attachment_manifests = []
@@ -743,7 +773,6 @@ class Send(object):
                 s3_write(os.environ["s3_databucket"], bodykey, bodyutf8)
 
             if attachment_uploads:
-                attachment_config = get_attachment_config()
                 attachment_storage = build_attachment_storage(attachment_config)
                 try:
                     attachment_manifests = store_attachments(

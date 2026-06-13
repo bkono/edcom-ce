@@ -9,10 +9,12 @@ import unittest
 try:
     import falcon
     from falcon import testing
+    from api.shared.send import possible_backend_types
     from api.transactional import parse_multipart_send_request
 except ModuleNotFoundError:
     falcon = None
     testing = None
+    possible_backend_types = None
     parse_multipart_send_request = None
 
 from api.shared.attachments import (
@@ -238,6 +240,168 @@ class TestAttachments(unittest.TestCase):
                 "content_type": "application/pdf",
                 "size": 9,
             },
+        )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_multipart_rejects_too_many_parts_before_buffering_extra_file(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p>Attached.</p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "first.pdf",
+                    "application/pdf",
+                    b"%PDF-1.7\n",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "second.pdf",
+                    "application/pdf",
+                    b"%PDF-1.7\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        resp = self.simulate_multipart_parse(body, boundary, config(max_count=1))
+
+        self.assertEqual(resp.status, "400 Bad Request")
+        self.assertIn("Too many attachments", resp.text)
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_multipart_rejects_total_size_before_buffering_past_limit(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p>Attached.</p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "first.txt",
+                    "text/plain",
+                    b"123456",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "second.txt",
+                    "text/plain",
+                    b"123456",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        resp = self.simulate_multipart_parse(body, boundary, config(max_total_bytes=10))
+
+        self.assertEqual(resp.status, "400 Bad Request")
+        self.assertIn("Attachments exceed maximum total size", resp.text)
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_route_backend_types_stop_after_first_routable_matching_rule(self):
+        route = {
+            "published": {
+                "rules": [
+                    {
+                        "domaingroup": "ses-only",
+                        "splits": [{"pct": 100, "policy": "ses-1"}],
+                    },
+                    {
+                        "domaingroup": "",
+                        "splits": [{"pct": 100, "policy": "mailgun-1"}],
+                    },
+                ]
+            }
+        }
+
+        backend_types = possible_backend_types(
+            route,
+            "customer@example.com",
+            {"ses-only": {"domains": "example.com"}},
+            {},
+            {},
+            {"mailgun-1": {"id": "mailgun-1"}},
+            {"ses-1": {"id": "ses-1"}},
+            {},
+            {},
+            {},
+        )
+
+        self.assertEqual(backend_types, {"ses"})
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_route_backend_types_keep_all_possibilities_in_first_routable_rule(self):
+        route = {
+            "published": {
+                "rules": [
+                    {
+                        "domaingroup": "",
+                        "splits": [
+                            {"pct": 50, "policy": "ses-1"},
+                            {"pct": 50, "policy": "mailgun-1"},
+                        ],
+                    },
+                    {
+                        "domaingroup": "",
+                        "splits": [{"pct": 100, "policy": "ses-2"}],
+                    },
+                ]
+            }
+        }
+
+        backend_types = possible_backend_types(
+            route,
+            "customer@example.com",
+            {},
+            {},
+            {},
+            {"mailgun-1": {"id": "mailgun-1"}},
+            {"ses-1": {"id": "ses-1"}, "ses-2": {"id": "ses-2"}},
+            {},
+            {},
+            {},
+        )
+
+        self.assertEqual(backend_types, {"ses", "mailgun"})
+
+    def simulate_multipart_parse(self, body, boundary, cfg):
+        class Resource:
+            def on_post(self, req, resp):
+                parse_multipart_send_request(req, cfg)
+                resp.media = {"ok": True}
+
+        app = falcon.App()
+        app.add_route("/send", Resource())
+        client = testing.TestClient(app)
+        return client.simulate_post(
+            "/send",
+            body=body,
+            headers={"content-type": "multipart/form-data; boundary=%s" % boundary},
         )
 
 

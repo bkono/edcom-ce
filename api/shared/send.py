@@ -743,24 +743,25 @@ def possible_backend_types(
         if not rule_matches:
             continue
 
+        rule_backend_types: Set[str] = set()
         for split in rule["splits"]:
             policyid = split.get("policy")
             if not policyid:
                 continue
             if policyid in mailgun:
-                backend_types.add("mailgun")
+                rule_backend_types.add("mailgun")
                 continue
             if policyid in ses:
-                backend_types.add("ses")
+                rule_backend_types.add("ses")
                 continue
             if policyid in sparkpost:
-                backend_types.add("sparkpost")
+                rule_backend_types.add("sparkpost")
                 continue
             if policyid in easylink:
-                backend_types.add("easylink")
+                rule_backend_types.add("easylink")
                 continue
             if policyid in smtprelays:
-                backend_types.add("smtprelay")
+                rule_backend_types.add("smtprelay")
                 continue
 
             policy = policies.get(policyid, None)
@@ -777,7 +778,10 @@ def possible_backend_types(
 
             for sink in published["sinks"]:
                 if sink["sink"] in sinks:
-                    backend_types.add("sink")
+                    rule_backend_types.add("sink")
+
+        if rule_backend_types:
+            return rule_backend_types
 
     return backend_types
 
