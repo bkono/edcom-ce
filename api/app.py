@@ -43,6 +43,7 @@ from .shared.send import send_rate, sparkpost_domain, mg_domain
 from .shared.tasks import tasks, HIGH_PRIORITY
 from .shared.s3 import s3_write, s3_size, s3_read, s3_copy, s3_delete, s3_write_stream
 from .shared import contacts
+from .shared.attachments import validate_attachment_startup
 from .shared.log import get_logger, get_root_logger
 from .shared.version import VERSION
 
@@ -61,6 +62,8 @@ logging.getLogger("botocore").setLevel(logging.INFO)
 logging.getLogger("nose").setLevel(logging.INFO)
 
 log = get_logger()
+
+validate_attachment_startup()
 
 # nothing returned by the web app should be cached by a proxy
 class NoCache(object):
