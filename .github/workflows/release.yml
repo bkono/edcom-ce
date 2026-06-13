@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Compute Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.version.outputs.build }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Generate release version
+        id: version
+        run: |
+          set -euo pipefail
+          build="$(date -u +1.%Y%m%d.%H%M)"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "tag=v$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            script: dev/build_amd64.sh
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            script: dev/build_arm64.sh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build install archives
+        env:
+          BUILD: ${{ needs.version.outputs.build }}
+        run: ${{ matrix.script }}
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            .build/edcom-install-${{ matrix.arch }}.tgz
+            .build/velocity-install-${{ matrix.arch }}.tgz
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tgz > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.version.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true
+          files: dist/*
