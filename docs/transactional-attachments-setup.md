@@ -33,6 +33,19 @@ The configured credentials must allow:
 Objects are application-temporary. The app deletes objects after terminal send
 success, suppression, or error. Bucket lifecycle is the backup cleanup layer.
 
+For AWS S3, create and configure the bucket with the repo script:
+
+```bash
+export EDCOM_ATTACHMENT_BUCKET="$EDCOM_ATTACHMENT_TEST_BUCKET"
+export EDCOM_ATTACHMENT_REGION="$EDCOM_ATTACHMENT_TEST_REGION"
+export EDCOM_ATTACHMENT_PREFIX="attachments/txn/"
+
+scripts/create_attachment_bucket.sh
+```
+
+For production, set `EDCOM_ATTACHMENT_BUCKET` and `EDCOM_ATTACHMENT_REGION` to
+the production bucket name and region before running the same script.
+
 ## App Configuration
 
 Add the attachment keys under the `app` object in `edcom-install/config/edcom.json`.
