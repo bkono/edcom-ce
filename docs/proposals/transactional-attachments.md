@@ -21,11 +21,11 @@ The historical reason attachments were not implemented was operational risk: unc
 - `send_txn` reads the queued body, deletes the temporary body file, generates final HTML, then calls `send_backend_mail`.
 - Provider sends already converge on shared helpers in `api/shared/send.py`: `ses_send`, `mailgun_send`, `sparkpost_send`, and `smtprelay_send`.
 - Despite helper names, `api/shared/s3.py` is local filesystem storage under mounted `/buckets/*`; there is no current real S3/R2 backend.
-- SES currently uses `send_email`. Attachment-bearing SES sends need either SES API v2 attachment support or raw MIME. Given the current code uses boto3 SES v1-style `send_email`, the least disruptive implementation is raw MIME via `send_raw_email`.
+- SES currently uses `send_email`. Attachment-bearing SES sends must use raw MIME through `send_raw_email`.
 
 ## Ship Target
 
-There are no intentionally deployable intermediate states for this feature. The branch should build, validate, and ship one complete transactional attachment implementation.
+There are no intentionally deployable intermediate states for this feature. The branch must build, validate, and ship one complete transactional attachment implementation.
 
 The complete ship target is:
 
@@ -34,10 +34,10 @@ The complete ship target is:
 - Attachment bytes are stored outside Postgres.
 - S3-compatible storage is available on day 0.
 - Cloudflare R2 is available on day 0 through the same S3-compatible backend.
-- Local storage exists only as an explicit dev/test/small-install backend, not as the recommended production backend.
+- Local storage exists only as an explicit dev/test backend, not as a production backend.
 - SES postal routes support attachment-bearing transactional sends.
 - Unsupported postal route types reject attachment-bearing sends clearly before queue acceptance.
-- Cleanup is enforced in the app and by storage backend lifecycle policy where available.
+- Cleanup is enforced in the app and by automatically managed storage backend lifecycle policy.
 
 ## Goals
 
@@ -56,14 +56,15 @@ The complete ship target is:
 - Velocity/internal MTA attachment support.
 - Persistent document library / asset manager semantics.
 - Virus scanning, DLP, or deep attachment content policy beyond size/type/filename hygiene.
-- Supporting every outbound provider before transactional SES is production complete.
+- Attachment delivery through Mailgun, SparkPost, external SMTP, or Velocity postal routes.
 
 ## External Constraints
 
-- SES supports multiple attachments up to a 40 MB total message size limit and documents unsupported file extensions. The implementation should set a lower platform default to leave MIME/base64 overhead and provider variance headroom.
+- SES supports multiple attachments up to a 40 MB total message size limit and documents unsupported file extensions. This implementation sets a lower platform default to leave MIME/base64 overhead and provider variance headroom.
 - AWS S3 lifecycle rules can expire objects.
 - Cloudflare R2 supports object lifecycle rules, including prefix-based expiration, and exposes lifecycle configuration through dashboard, Wrangler, and S3 API-compatible operations.
 - R2 supports S3-compatible client configuration with an account-specific endpoint and `region = "auto"`.
+- S3/R2 lifecycle policies operate on day-level expiry. Application cleanup remains responsible for the 24-hour operational TTL; bucket lifecycle is the backup cleanup layer.
 
 Sources:
 - <https://docs.aws.amazon.com/ses/latest/dg/attachments.html>
@@ -71,21 +72,22 @@ Sources:
 - <https://developers.cloudflare.com/r2/buckets/object-lifecycles/>
 - <https://developers.cloudflare.com/r2/api/s3/api/>
 
-## Recommended Architecture
+## Architecture
 
 Introduce attachment handling as four separate concerns:
 
 1. **Ingress parsing**
    - SMTP relay parses inbound MIME and extracts attachments.
    - API accepts attachment-bearing multipart requests.
-   - API may also accept JSON base64 attachments for compatibility, but multipart is the primary large-payload path.
+   - API accepts JSON base64 attachments for compatibility with existing transactional API clients.
+   - Multipart is the primary path for large API payloads.
 
 2. **Object storage**
    - Store bytes outside Postgres.
    - Queue only attachment manifests.
    - Production backend: S3-compatible object storage.
    - Supported production targets: AWS S3 and Cloudflare R2.
-   - Local backend: explicit dev/test fallback.
+   - Local backend: explicit dev/test fallback only.
 
 3. **Transactional queue contract**
    - `txnqueue.data` stores sender/recipient/template data plus `attachments[]` manifests.
@@ -95,11 +97,9 @@ Introduce attachment handling as four separate concerns:
 4. **Provider rendering**
    - Build provider-specific outbound payloads from the same attachment manifest.
    - SES: MIME message sent with `send_raw_email`.
-   - External SMTP backend: MIME message over `smtplib` if supported in this ship target.
-   - Mailgun/SparkPost: either implemented from the same manifest or explicitly rejected for attachment-bearing transactional sends until added.
-   - Velocity/internal MTA: explicitly rejected for attachment-bearing transactional sends.
+   - Mailgun/SparkPost/external SMTP/Easylink/Velocity/internal MTA: explicitly rejected for attachment-bearing transactional sends in this shipment.
 
-The reusable boundary is the manifest + storage + provider rendering layer. Transactional code should populate the manifest, not own the storage abstraction or MIME assembly details.
+The reusable boundary is the manifest + storage + provider rendering layer. Transactional code must populate the manifest, not own the storage abstraction or MIME assembly details.
 
 ## Attachment Manifest
 
@@ -143,7 +143,7 @@ Required operations:
 - `open_read(manifest) -> binary stream`
 - `delete(manifest) -> None`
 - `exists(manifest) -> bool`
-- `configure_lifecycle(prefix, ttl_days) -> validation/result`
+- `configure_lifecycle(prefix, expiration_days, abort_multipart_days) -> validation/result`
 - `healthcheck() -> validation/result`
 
 Production backend:
@@ -151,22 +151,82 @@ Production backend:
 - Configurable endpoint URL for R2.
 - Configurable region, bucket, access key, secret key.
 - R2 uses account endpoint and `region_name="auto"`.
+- Startup healthcheck must prove the configured backend can write, read, delete, and configure lifecycle rules for the attachment prefix.
+- Production startup fails closed when attachment storage is enabled but lifecycle configuration cannot be applied.
 
 Local backend:
 - Uses a configured mounted path.
-- Allowed for development and explicit small installs.
+- Allowed for development and tests.
 - Must enforce the same size/TTL/delete contract.
+- Must not be used for Bryan's production deployment.
 
 Do not store attachment objects under publicly served `/transfer` or image buckets.
+
+## Configuration Contract
+
+Use explicit attachment-specific config keys. Do not reuse `s3_databucket`, `s3_transferbucket`, `s3_imagebucket`, or `s3_blockbucket`.
+
+Required production config:
+
+- `attachment_enabled=true`
+- `attachment_storage_backend=s3`
+- `attachment_s3_bucket=<bucket-name>`
+- `attachment_s3_prefix=attachments/txn/`
+- `attachment_s3_region=<aws-region-or-auto>`
+- `attachment_s3_access_key=<access-key>`
+- `attachment_s3_secret_key=<secret-key>`
+- `attachment_s3_endpoint_url=<empty-for-aws-s3-or-r2-endpoint>`
+- `attachment_manage_lifecycle=true`
+- `attachment_ttl_hours=24`
+- `attachment_lifecycle_expiration_days=2`
+- `attachment_lifecycle_abort_multipart_days=1`
+- `attachment_max_count=5`
+- `attachment_max_file_bytes=10485760`
+- `attachment_max_total_bytes=20971520`
+- `attachment_max_mime_bytes=31457280`
+
+R2 production config:
+
+- `attachment_storage_backend=s3`
+- `attachment_s3_region=auto`
+- `attachment_s3_endpoint_url=https://<account_id>.r2.cloudflarestorage.com`
+
+Behavior:
+
+- If `attachment_enabled=false`, attachment-bearing requests are rejected.
+- If `attachment_enabled=true` and storage healthcheck fails, API startup fails.
+- If `attachment_enabled=true` and lifecycle configuration fails, API startup fails.
+- Existing no-attachment transactional sends must keep working when attachments are disabled.
+
+## Attachment Policy
+
+Allowed attachment policy:
+
+- Allow only these filename extensions and MIME types:
+  - `.pdf`: `application/pdf`
+  - `.txt`: `text/plain`
+  - `.csv`: `text/csv`, `application/csv`
+  - `.png`: `image/png`
+  - `.jpg`, `.jpeg`: `image/jpeg`
+  - `.docx`: `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+  - `.xlsx`: `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- Require valid filename extension.
+- Require filename extension to match the declared content type.
+- Require PDF, PNG, and JPEG magic-number validation.
+- Always reject SES unsupported extensions.
+- Always reject executable/script/archive formats: `.exe`, `.dll`, `.bat`, `.cmd`, `.com`, `.scr`, `.ps1`, `.js`, `.vbs`, `.jar`, `.msi`, `.zip`, `.rar`, `.7z`, `.tar`, `.gz`.
+- Reject files whose validated signature contradicts the claimed safe type.
+
+The first end-to-end production validation artifact must be a PDF invoice-style attachment sent through SES.
 
 ## Ingress Contract
 
 ### API Multipart Request
 
-Primary API path for attachments should be `multipart/form-data`:
+Primary API path for attachments is `multipart/form-data`:
 
-- One JSON metadata field, for example `payload`.
-- One or more file parts, for example `attachments`.
+- One JSON metadata field named `payload`.
+- One or more repeated file parts named `attachment`.
 - File parts stream into the configured attachment storage backend.
 - API stores only manifests in `txnqueue.data`.
 
@@ -174,7 +234,7 @@ This avoids bloating JSON requests and avoids the relay/API base64 gap.
 
 ### API JSON Request
 
-Optional compatibility path:
+Compatibility path for existing JSON-oriented clients:
 
 ```json
 {
@@ -192,18 +252,26 @@ Optional compatibility path:
 }
 ```
 
-If supported, JSON base64 must have stricter request limits than multipart. It is not the preferred path for large attachments.
+JSON base64 behavior:
+
+- Supported on day 0.
+- Uses the same decoded attachment limits as multipart.
+- Subject to an additional raw request body cap of 32 MiB.
+- Decoded bytes are written through the same attachment storage abstraction.
+- Queued data contains only manifests.
 
 ### SMTP Relay
 
-Relay parsing should:
+Relay parsing must:
 
 - Continue extracting best HTML/plain body.
 - Extract attachment parts from nested `multipart/mixed` messages.
-- Preserve filename, content type, disposition, optional content ID.
+- Preserve filename, content type, disposition, and nullable `content_id`.
 - Decode transfer encoding correctly.
 - Enforce relay-side max message and max attachment limits.
 - Submit to `/api/transactional/send` as multipart, not JSON base64.
+- Submit one API request per accepted SMTP recipient to preserve current relay semantics.
+- Upload a distinct attachment object per queued recipient message; do not introduce shared transactional attachment references or refcounting in this shipment.
 
 The relay will still temporarily hold decoded parts while parsing the SMTP message. That is acceptable only because the SMTP server already has a configured max message size and the relay must reject oversized messages before API submission. The important production constraint is that the relay does not write attachments to local disk and does not send inflated base64 JSON to the API.
 
@@ -224,8 +292,9 @@ Attachment path:
 
 Optimization when storage is S3/R2:
 - Do not download attachment objects until the message is actually selected for send.
-- Stream object reads into MIME assembly where practical.
-- Use bounded temp files only if the Python email/MIME builder requires materialization.
+- Read attachment objects exactly once per send attempt.
+- Keep MIME assembly bounded by `attachment_max_mime_bytes`.
+- Materialize attachment bytes only inside the worker process that is sending the message.
 - Delete objects immediately after terminal success/error.
 - Rely on bucket lifecycle as a second-line cleanup for orphaned objects.
 
@@ -236,11 +305,23 @@ For the first transactional shipment:
 - SES must support attachments.
 - SMTP ingress must support attachments.
 - API ingress must support attachments.
-- Mailgun/SparkPost/external SMTP can be included if completed against the same manifest contract, but they are not required for Bryan's SES production path.
-- Any provider not implemented must reject attachment-bearing sends before queue acceptance or before route dispatch with a deterministic user-visible error.
-- Velocity/internal MTA is out of scope and should reject attachment-bearing transactional sends.
+- Mailgun, SparkPost, external SMTP, Easylink, Velocity/internal MTA, and unknown route types reject attachment-bearing transactional sends.
 
 This is not a partial deployment gap. It is an explicit provider support matrix.
+
+Required provider support matrix:
+
+| Route type | Attachment-bearing transactional sends |
+| --- | --- |
+| SES | supported |
+| Mailgun | rejected |
+| SparkPost | rejected |
+| External SMTP relay | rejected |
+| Easylink | rejected |
+| Velocity/internal MTA sink | rejected |
+| Unknown/unresolved route | rejected |
+
+Route rejection must happen before queue acceptance. The API must resolve the selected postal route for attachment-bearing sends during `/api/transactional/send` validation. If the route can resolve to more than one provider type, every possible selected provider must be attachment-capable; otherwise the request is rejected with a deterministic message.
 
 ## Lifecycle and Cleanup
 
@@ -253,12 +334,13 @@ Cleanup must be defense in depth:
 
 2. **Queued orphan cleanup**
    - Scheduled cleanup scans attachment prefixes for expired objects.
-   - Cleanup should not depend solely on `txnqueue`; it must tolerate partially failed queue writes.
+   - Cleanup must not depend solely on `txnqueue`; it must tolerate partially failed queue writes.
 
 3. **Bucket lifecycle**
    - Configure S3/R2 lifecycle expiration on the attachment prefix.
-   - Use short TTL appropriate for transactional sends, for example one to three days.
-   - Configure incomplete multipart upload cleanup where supported.
+   - Expire objects under `attachments/txn/` after two days.
+   - Abort incomplete multipart uploads under `attachments/txn/` after one day.
+   - Apply lifecycle configuration automatically during API startup when `attachment_enabled=true`.
 
 4. **Observability**
    - Log upload, manifest creation, send consumption, and cleanup failures.
@@ -266,7 +348,7 @@ Cleanup must be defense in depth:
 
 ## Operational Limits
 
-Suggested defaults:
+Required defaults:
 
 - Attachments disabled unless storage backend is configured.
 - Production storage backend: `s3`.
@@ -276,8 +358,9 @@ Suggested defaults:
 - Max decoded attachment bytes total: 20 MiB.
 - Max estimated final MIME bytes: 30 MiB.
 - Attachment TTL: 24 hours.
-- Bucket lifecycle expiration: one to three days on `attachments/txn/`.
-- SMTP max message size should be aligned with the platform MIME cap.
+- Bucket lifecycle expiration: two days on `attachments/txn/`.
+- Incomplete multipart upload abort: one day on `attachments/txn/`.
+- SMTP max message size: 30 MiB.
 
 These defaults intentionally sit below SES's 40 MB total message limit to leave room for MIME/base64 overhead and downstream provider variation.
 
@@ -285,7 +368,7 @@ These defaults intentionally sit below SES's 40 MB total message limit to leave 
 
 1. **Lock configuration and limits**
    - Add config/env names for attachment enablement, backend, bucket, prefix, endpoint URL, region, credentials, TTL, and size limits.
-   - Decide production default behavior when backend is missing: reject attachments.
+   - Implement fail-closed startup behavior when attachment storage or lifecycle validation fails.
 
 2. **Build attachment storage abstraction**
    - Implement local backend.
@@ -296,8 +379,9 @@ These defaults intentionally sit below SES's 40 MB total message limit to leave 
 
 3. **Define manifest and validation helpers**
    - Filename sanitization.
-   - Content type handling.
+   - Extension/MIME allowlist enforcement.
    - Extension denylist aligned with SES unsupported attachment types.
+   - PDF/PNG/JPEG magic-number validation.
    - Size accounting and final MIME size estimation.
    - Idempotent cleanup helpers.
 
@@ -307,7 +391,7 @@ These defaults intentionally sit below SES's 40 MB total message limit to leave 
    - Store manifests in `txnqueue.data`.
    - Preserve existing JSON body behavior for no-attachment sends.
 
-5. **Add optional API JSON attachment ingestion**
+5. **Add API JSON attachment ingestion**
    - Decode base64 under stricter caps.
    - Store decoded bytes through the same storage abstraction.
    - Queue only manifests.
@@ -330,14 +414,14 @@ These defaults intentionally sit below SES's 40 MB total message limit to leave 
    - Preserve `sesmessages`, stats, and error behavior.
 
 9. **Add provider support matrix enforcement**
-   - Reject attachment sends for unsupported route types.
+   - Reject attachment sends for every non-SES route type.
+   - Reject attachment sends when a route can resolve to any non-SES provider.
    - Ensure unsupported route rejection is deterministic and tested.
-   - Optionally implement Mailgun/SparkPost/external SMTP through the same manifest contract.
 
 10. **Add cleanup workers**
     - Immediate cleanup after terminal send result.
     - Scheduled orphan cleanup.
-    - Lifecycle setup/validation docs for S3/R2.
+    - Automatic lifecycle setup and validation for S3/R2.
 
 11. **Add observability**
     - Structured logs for upload, queue, send, cleanup.
@@ -346,7 +430,7 @@ These defaults intentionally sit below SES's 40 MB total message limit to leave 
 12. **Validate end to end**
     - SMTP relay with PDF attachment through SES route.
     - API multipart with PDF attachment through SES route.
-    - API JSON compatibility if enabled.
+    - API JSON with PDF attachment through SES route.
     - R2 storage backend.
     - S3 storage backend.
     - Local backend in dev/test.
@@ -357,7 +441,7 @@ These defaults intentionally sit below SES's 40 MB total message limit to leave 
 
 ## Campaign / Funnel Level-Up
 
-Campaign/funnel attachment support should be a separate feature after transactional attachments ship.
+Campaign/funnel attachment support is a separate feature after transactional attachments ship.
 
 This proposal intentionally lays groundwork for it:
 
@@ -374,7 +458,7 @@ But campaign/funnel support needs focused product and UI decisions:
 - Whether attachments can vary per recipient.
 - How to reuse one stored object across many recipients.
 - How campaign-level limits differ from transactional limits.
-- How Velocity/internal MTA should support bulk attachments, if at all.
+- Velocity/internal MTA bulk attachment support is outside the scope of this transactional proposal.
 
 Do not implement campaign/funnel attachment behavior as part of the transactional shipment.
 
@@ -387,13 +471,7 @@ Do not implement campaign/funnel attachment behavior as part of the transactiona
 - Do not expose attachment objects through public `/transfer` or image URLs.
 - Do not claim Velocity/internal MTA support without extending its API and sender.
 - Do not mix campaign/funnel UI mechanics into this transactional feature.
-
-## Open Questions
-
-- Should JSON base64 attachment ingestion be included for compatibility, or should the API require multipart for attachment-bearing sends?
-- Should Mailgun/SparkPost/external SMTP be implemented now or explicitly rejected for attachments until after SES transactional support is shipped?
-- Should the default MIME type policy be PDF-first for Bryan's workflow or broad with SES-style blocked extensions?
-- Should lifecycle configuration be applied automatically when credentials allow it, or validated/documented but left as an operator step?
+- Do not add Mailgun, SparkPost, external SMTP, Easylink, or Velocity attachment delivery in this shipment.
 
 ## Decision Ledger
 
@@ -402,7 +480,10 @@ Do not implement campaign/funnel attachment behavior as part of the transactiona
 - The ship target is one complete transactional attachment feature, not staged deployable intermediates.
 - S3-compatible storage, including AWS S3 and Cloudflare R2, is required on day 0.
 - SMTP relay will submit attachment-bearing requests as multipart, not base64 JSON.
+- Transactional API supports both multipart attachments and JSON base64 attachments on day 0.
 - SES attachment support is mandatory and uses raw MIME with `send_raw_email` from the current SES helper path.
+- Attachment-bearing transactional sends through non-SES route types are rejected.
+- Storage lifecycle configuration is applied automatically and startup fails closed if it cannot be applied.
 - Campaign/funnel attachments are deferred as a separate level-up feature.
 - Velocity/internal MTA attachment support is out of scope for this transactional shipment.
 
@@ -410,7 +491,8 @@ Do not implement campaign/funnel attachment behavior as part of the transactiona
 
 - Local-only production attachment storage is rejected for Bryan's current VPS constraints.
 - Base64 attachment blobs in Postgres are rejected.
-- Planned runtime gaps are rejected; incomplete states may exist during development but are not deployment targets.
+- Planned runtime gaps are rejected; development-only incomplete states are not deployment targets.
+- Non-SES attachment delivery is rejected for this transactional shipment.
 - Campaign/funnel support is not part of this proposal's acceptance criteria.
 - Velocity/internal MTA support is not part of this proposal's acceptance criteria.
 
