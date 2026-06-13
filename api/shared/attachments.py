@@ -416,6 +416,20 @@ def validate_attachment_collection(
         raise AttachmentError("Attachments exceed maximum MIME message size")
 
 
+def read_limited_stream(stream: BinaryIO, limit: int) -> bytes:
+    chunks = []
+    total = 0
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise AttachmentError("Attachment exceeds maximum file size")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class LocalAttachmentStorage:
     storage_backend = "local"
 

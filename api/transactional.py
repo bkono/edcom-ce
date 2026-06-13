@@ -8,6 +8,7 @@ import email.utils
 import traceback
 import csv
 import zipfile
+from typing import Any, List, Tuple
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
 from email.utils import formataddr, parseaddr
@@ -29,6 +30,16 @@ from .shared.send import (
     check_send_limit,
     check_test_limit,
     load_domain_throttles,
+)
+from .shared.attachments import (
+    AttachmentError,
+    AttachmentUpload,
+    build_attachment_storage,
+    decode_json_attachment,
+    delete_attachments,
+    get_attachment_config,
+    read_limited_stream,
+    store_attachments,
 )
 from .shared.db import json_iter, open_db, JsonObj
 from .shared.tasks import tasks, LOW_PRIORITY, HIGH_PRIORITY
@@ -452,6 +463,121 @@ class TagMessages(object):
         ]
 
 
+def parse_send_request(
+    req: falcon.Request,
+) -> Tuple[JsonObj, List[AttachmentUpload]]:
+    content_type = req.content_type or ""
+    config = get_attachment_config()
+    if content_type.startswith("multipart/form-data"):
+        return parse_multipart_send_request(req, config)
+    return parse_json_send_request(req, config)
+
+
+def parse_json_send_request(
+    req: falcon.Request,
+    config: Any,
+) -> Tuple[JsonObj, List[AttachmentUpload]]:
+    doc = req.context.get("doc")
+    if not doc:
+        raise falcon.HTTPBadRequest(
+            title="Not JSON", description="A valid JSON document is required."
+        )
+    raw_body = req.context.get("body_raw", b"")
+    raw_attachments = doc.get("attachments") or []
+    if raw_attachments and len(raw_body) > config.json_body_max_bytes:
+        raise falcon.HTTPBadRequest(
+            title="Request too large",
+            description="Attachment JSON request body exceeds the maximum size",
+        )
+    if raw_attachments and not isinstance(raw_attachments, list):
+        raise falcon.HTTPBadRequest(
+            title="Invalid attachments",
+            description="attachments must be an array",
+        )
+    try:
+        uploads = [
+            decode_json_attachment(attachment, config)
+            for attachment in raw_attachments
+        ]
+    except AttachmentError as e:
+        raise falcon.HTTPBadRequest(
+            title="Invalid attachment", description=str(e)
+        )
+    doc.pop("attachments", None)
+    return doc, uploads
+
+
+def parse_multipart_send_request(
+    req: falcon.Request,
+    config: Any,
+) -> Tuple[JsonObj, List[AttachmentUpload]]:
+    payload = None
+    uploads = []
+    try:
+        media = req.get_media()
+        for part in media:
+            if part.name == "payload":
+                if payload is not None:
+                    raise falcon.HTTPBadRequest(
+                        title="Invalid multipart request",
+                        description="Only one payload field is allowed",
+                    )
+                payload = part.text
+                continue
+            if part.name != "attachment":
+                raise falcon.HTTPBadRequest(
+                    title="Invalid multipart request",
+                    description="Only payload and attachment fields are allowed",
+                )
+
+            filename = getattr(part, "filename", "") or ""
+            content_type = getattr(part, "content_type", "") or ""
+            stream = getattr(part, "stream", None)
+            if stream is None:
+                data = getattr(part, "data", b"")
+                if isinstance(data, str):
+                    data = data.encode("utf-8")
+                if len(data) > config.max_file_bytes:
+                    raise AttachmentError("Attachment exceeds maximum file size")
+            else:
+                data = read_limited_stream(stream, config.max_file_bytes)
+            uploads.append(
+                AttachmentUpload(
+                    filename=filename,
+                    content_type=content_type,
+                    data=data,
+                )
+            )
+    except falcon.HTTPError:
+        raise
+    except AttachmentError as e:
+        raise falcon.HTTPBadRequest(
+            title="Invalid attachment", description=str(e)
+        )
+    except Exception as e:
+        raise falcon.HTTPBadRequest(
+            title="Invalid multipart request", description=str(e)
+        )
+
+    if payload is None:
+        raise falcon.HTTPBadRequest(
+            title="Missing payload",
+            description="Multipart transactional sends require a payload field",
+        )
+    try:
+        doc = json.loads(payload)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        raise falcon.HTTPBadRequest(
+            title="Malformed payload",
+            description="payload must be a valid UTF-8 JSON document",
+        )
+    if not isinstance(doc, dict):
+        raise falcon.HTTPBadRequest(
+            title="Malformed payload", description="payload must be a JSON object"
+        )
+    return doc, uploads
+
+
 class Send(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
@@ -459,11 +585,7 @@ class Send(object):
 
         db = req.context["db"]
 
-        doc = req.context.get("doc")
-        if not doc:
-            raise falcon.HTTPBadRequest(
-                title="Not JSON", description="A valid JSON document is required."
-            )
+        doc, attachment_uploads = parse_send_request(req)
 
         template = None
         if doc.get("template", ""):
@@ -566,11 +688,6 @@ class Send(object):
         txnmsgid, _ = parse_txnid(campid)
 
         bodykey = ""
-        if template is None:
-            bodyutf8 = doc["body"].encode("utf-8")
-            bodykey = "templates/txn/%s/%s.html" % (mycid, shortuuid.uuid())
-            s3_write(os.environ["s3_databucket"], bodykey, bodyutf8)
-
         _, addr = parseaddr(doc["to"])
         if "@" not in addr:
             raise falcon.HTTPBadRequest(
@@ -579,45 +696,76 @@ class Send(object):
             )
         domain = addr.split("@")[1]
 
-        db.execute(
-            "insert into txnqueue (cid, route, domain, data) values (%s, %s, %s, %s)",
-            mycid,
-            doc["route"],
-            domain,
-            {
-                "tag": tag,
-                "template": doc.get("template", ""),
-                "body": bodykey,
-                "variables": doc.get("variables", None),
-                "to": doc["to"],
-                "fromname": doc.get("fromname", ""),
-                "fromemail": doc.get("fromemail", ""),
-                "returnpath": doc.get("returnpath", ""),
-                "replyto": doc.get("replyto", ""),
-                "subject": doc["subject"],
-                "toname": doc.get("toname"),
-                "route": doc["route"],
-                "campid": campid,
-                "disableopens": txnsettings.get("disableopens", False),
-            },
-        )
-        db.execute(
-            "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
-            shortuuid.uuid(),
-            mycid,
-            datetime.utcnow(),
-            txnmsgid,
-            {
-                "event": "Injection",
-                "status": "Accepted",
-                "subject": doc["subject"],
-                "tag": tag,
-                "fromname": doc.get("fromname", ""),
-                "fromemail": doc.get("fromemail", "") or doc.get("returnpath", ""),
-                "toname": doc.get("toname"),
-                "to": doc["to"],
-            },
-        )
+        attachment_storage = None
+        attachment_manifests = []
+        try:
+            if template is None:
+                bodyutf8 = doc["body"].encode("utf-8")
+                bodykey = "templates/txn/%s/%s.html" % (mycid, shortuuid.uuid())
+                s3_write(os.environ["s3_databucket"], bodykey, bodyutf8)
+
+            if attachment_uploads:
+                attachment_config = get_attachment_config()
+                attachment_storage = build_attachment_storage(attachment_config)
+                try:
+                    attachment_manifests = store_attachments(
+                        attachment_storage,
+                        attachment_config,
+                        mycid,
+                        txnmsgid,
+                        attachment_uploads,
+                        doc.get("body", ""),
+                    )
+                except AttachmentError as e:
+                    raise falcon.HTTPBadRequest(
+                        title="Invalid attachment", description=str(e)
+                    )
+
+            db.execute(
+                "insert into txnqueue (cid, route, domain, data) values (%s, %s, %s, %s)",
+                mycid,
+                doc["route"],
+                domain,
+                {
+                    "tag": tag,
+                    "template": doc.get("template", ""),
+                    "body": bodykey,
+                    "variables": doc.get("variables", None),
+                    "to": doc["to"],
+                    "fromname": doc.get("fromname", ""),
+                    "fromemail": doc.get("fromemail", ""),
+                    "returnpath": doc.get("returnpath", ""),
+                    "replyto": doc.get("replyto", ""),
+                    "subject": doc["subject"],
+                    "toname": doc.get("toname"),
+                    "route": doc["route"],
+                    "campid": campid,
+                    "disableopens": txnsettings.get("disableopens", False),
+                    "attachments": attachment_manifests,
+                },
+            )
+            db.execute(
+                "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+                shortuuid.uuid(),
+                mycid,
+                datetime.utcnow(),
+                txnmsgid,
+                {
+                    "event": "Injection",
+                    "status": "Accepted",
+                    "subject": doc["subject"],
+                    "tag": tag,
+                    "fromname": doc.get("fromname", ""),
+                    "fromemail": doc.get("fromemail", "")
+                    or doc.get("returnpath", ""),
+                    "toname": doc.get("toname"),
+                    "to": doc["to"],
+                },
+            )
+        except Exception:
+            if attachment_storage is not None and attachment_manifests:
+                delete_attachments(attachment_storage, attachment_manifests)
+            raise
 
         req.context["result"] = {"tag": tag, "to": doc["to"], "result": "ok"}
 
