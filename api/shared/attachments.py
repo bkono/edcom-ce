@@ -792,6 +792,8 @@ def build_raw_mime_message(
 
 
 def decode_json_attachment(item: Dict[str, str], config: AttachmentConfig) -> AttachmentUpload:
+    if not isinstance(item, dict):
+        raise AttachmentError("Attachment must be a JSON object")
     try:
         data = base64.b64decode(item.get("content", ""), validate=True)
     except (binascii.Error, ValueError):

@@ -48,6 +48,30 @@ JVBERi0xLjcK
 	}
 }
 
+func TestExtractMessagePreservesNestedMultipartBoundaryCase(t *testing.T) {
+	body := strings.ReplaceAll(`--outer
+Content-Type: multipart/alternative; boundary="AltBoundaryX"
+
+--AltBoundaryX
+Content-Type: text/plain; charset=utf-8
+
+Plain body.
+--AltBoundaryX
+Content-Type: text/html; charset=utf-8
+
+<p>HTML body.</p>
+--AltBoundaryX--
+--outer--`, "\n", "\r\n")
+
+	msg, err := extractMessage([]byte(body), `multipart/mixed; boundary="outer"`, "")
+	if err != nil {
+		t.Fatalf("extractMessage returned error: %s", err)
+	}
+	if msg.Body != "<p>HTML body.</p>" {
+		t.Fatalf("expected HTML body, got %q", msg.Body)
+	}
+}
+
 func TestExtractMessageWithoutAttachmentPreservesPlainTextFallback(t *testing.T) {
 	body := strings.ReplaceAll(`--boundary
 Content-Type: text/plain; charset=utf-8

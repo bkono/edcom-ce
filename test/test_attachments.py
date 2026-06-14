@@ -153,6 +153,10 @@ class TestAttachments(unittest.TestCase):
         self.assertEqual(upload.filename, "invoice.pdf")
         self.assertEqual(upload.data, b"%PDF-1.7\n")
 
+    def test_rejects_non_object_json_attachment(self):
+        with self.assertRaises(AttachmentError):
+            decode_json_attachment(None, config())
+
     def test_local_storage_manifest_and_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = config(local_path=root)

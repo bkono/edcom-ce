@@ -194,7 +194,6 @@ func parseMultipartMessage(body []byte, boundary string) (extractedMessage, erro
 		}
 
 		mediaType = strings.ToLower(mediaType)
-		contentType = strings.ToLower(contentType)
 		if contentType == "" {
 			contentType = "application/octet-stream"
 		}
