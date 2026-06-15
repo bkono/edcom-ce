@@ -485,13 +485,15 @@ def parse_json_send_request(
             title="Not JSON", description="A valid JSON document is required."
         )
     raw_body = req.context.get("body_raw", b"")
-    raw_attachments = doc.get("attachments") or []
+    raw_attachments = doc.get("attachments", [])
+    if raw_attachments is None:
+        raw_attachments = []
     if raw_attachments and len(raw_body) > config.json_body_max_bytes:
         raise falcon.HTTPBadRequest(
             title="Request too large",
             description="Attachment JSON request body exceeds the maximum size",
         )
-    if raw_attachments and not isinstance(raw_attachments, list):
+    if not isinstance(raw_attachments, list):
         raise falcon.HTTPBadRequest(
             title="Invalid attachments",
             description="attachments must be an array",
@@ -559,8 +561,10 @@ def parse_multipart_attachment_metadata(part: Any, config: Any) -> JsonObj:
             title="Malformed attachment metadata",
             description="attachment_metadata must be a JSON object",
         )
-    disposition = metadata.get("disposition", "attachment") or "attachment"
-    content_id = metadata.get("content_id") or None
+    disposition = metadata.get("disposition", "attachment")
+    if disposition == "":
+        disposition = "attachment"
+    content_id = metadata.get("content_id")
     if not isinstance(disposition, str):
         raise falcon.HTTPBadRequest(
             title="Malformed attachment metadata",
@@ -573,7 +577,7 @@ def parse_multipart_attachment_metadata(part: Any, config: Any) -> JsonObj:
         )
     return {
         "disposition": disposition,
-        "content_id": content_id.strip("<>") if content_id else None,
+        "content_id": content_id.strip().strip("<>") if content_id else None,
     }
 
 

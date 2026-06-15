@@ -342,7 +342,23 @@ def _validate_signature(ext: str, data: bytes) -> None:
         or data.startswith(b"PK\x07\x08")
     ):
         raise AttachmentError("Attachment content is not a valid ZIP container")
-    if ext == ".mp4" and not _has_ftyp_brand(data, {b"isom", b"iso2", b"mp41", b"mp42"}):
+    if ext == ".mp4" and not _has_ftyp_brand(
+        data,
+        {
+            b"avc1",
+            b"dash",
+            b"iso2",
+            b"iso6",
+            b"isom",
+            b"m4v ",
+            b"M4V ",
+            b"mp41",
+            b"mp42",
+            b"mp71",
+            b"msdh",
+            b"msix",
+        },
+    ):
         raise AttachmentError("Attachment content is not a valid MP4")
     if ext == ".mov" and not _has_ftyp_brand(data, {b"qt  "}):
         raise AttachmentError("Attachment content is not a valid MOV")
@@ -356,7 +372,32 @@ def _has_ftyp_brand(data: bytes, allowed_brands: set[bytes]) -> bool:
     # ISO BMFF files start with a 32-bit box size followed by "ftyp".
     if data[4:8] != b"ftyp":
         return False
-    return data[8:12] in allowed_brands
+    box_size = int.from_bytes(data[0:4], "big")
+    if box_size < 12:
+        return False
+    brand_bytes = data[8 : min(len(data), box_size)]
+    for offset in range(0, len(brand_bytes) - 3, 4):
+        if brand_bytes[offset : offset + 4] in allowed_brands:
+            return True
+    return False
+
+
+def _normalize_content_id(content_id: Optional[str]) -> Optional[str]:
+    if content_id is None:
+        return None
+    normalized = content_id.strip().strip("<>")
+    if not normalized:
+        return None
+    if any(char in normalized for char in ("\r", "\n", "<", ">")):
+        raise AttachmentError("Attachment content_id is invalid")
+    return normalized
+
+
+def _mime_content_id(content_id: str) -> str:
+    normalized = _normalize_content_id(content_id)
+    if normalized is None:
+        raise AttachmentError("Attachment content_id is invalid")
+    return "<%s>" % normalized
 
 
 def validate_attachment_upload(upload: AttachmentUpload, config: AttachmentConfig) -> None:
@@ -372,6 +413,7 @@ def validate_attachment_upload(upload: AttachmentUpload, config: AttachmentConfi
         raise AttachmentError("Attachment content type does not match its extension")
     if upload.disposition not in ("attachment", "inline"):
         raise AttachmentError("Attachment disposition must be attachment or inline")
+    _normalize_content_id(upload.content_id)
     if not upload.data:
         raise AttachmentError("Attachment must not be empty")
     if len(upload.data) > config.max_file_bytes:
@@ -720,7 +762,7 @@ def store_attachments(
                     filename=filename,
                     content_type=content_type,
                     disposition=upload.disposition,
-                    content_id=upload.content_id,
+                    content_id=_normalize_content_id(upload.content_id),
                     size=len(upload.data),
                     sha256=sha256,
                     created_at=created_at.isoformat() + "Z",
@@ -785,7 +827,7 @@ def build_raw_mime_message(
             "disposition": manifest["disposition"],
         }
         if manifest.get("content_id"):
-            kwargs["cid"] = manifest["content_id"]
+            kwargs["cid"] = _mime_content_id(manifest["content_id"])
         msg.add_attachment(data, **kwargs)
 
     return msg.as_bytes()

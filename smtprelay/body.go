@@ -214,7 +214,7 @@ func parseMultipartMessage(body []byte, boundary string) (extractedMessage, erro
 					disposition = "inline"
 				}
 			}
-			contentID := strings.Trim(p.Header.Get("Content-ID"), "<>")
+			contentID := strings.Trim(strings.TrimSpace(p.Header.Get("Content-ID")), "<>")
 			msg.Attachments = append(msg.Attachments, Attachment{
 				Filename:    filename,
 				ContentType: mediaType,

@@ -14,6 +14,7 @@ try:
     from api.shared.send import do_ses_send_task, possible_backend_types
     from api.transactional import (
         attachment_manifests_expired,
+        parse_json_send_request,
         parse_multipart_send_request,
     )
 except ModuleNotFoundError:
@@ -22,6 +23,7 @@ except ModuleNotFoundError:
     do_ses_send_task = None
     possible_backend_types = None
     attachment_manifests_expired = None
+    parse_json_send_request = None
     parse_multipart_send_request = None
 
 from api.shared.attachments import (
@@ -121,6 +123,23 @@ class TestAttachments(unittest.TestCase):
         with self.assertRaises(AttachmentError):
             validate_attachment_collection([upload], config())
 
+    def test_allows_mp4_compatible_brand_signature(self):
+        data = (
+            b"\x00\x00\x00\x20"
+            b"ftyp"
+            b"m4v "
+            b"\x00\x00\x00\x00"
+            b"isom"
+            b"mp42"
+            b"avc1"
+            b"\x00\x00\x00\x00"
+        )
+
+        validate_attachment_collection(
+            [AttachmentUpload("clip.mp4", "video/mp4", data)],
+            config(),
+        )
+
     def test_allows_utf8_markdown(self):
         upload = AttachmentUpload(
             "notes.md",
@@ -198,6 +217,21 @@ class TestAttachments(unittest.TestCase):
 
         self.assertIsNone(upload.content_id)
 
+    def test_rejects_invalid_content_id(self):
+        with self.assertRaises(AttachmentError):
+            validate_attachment_collection(
+                [
+                    AttachmentUpload(
+                        "logo.png",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n",
+                        disposition="inline",
+                        content_id="bad\r\nid",
+                    )
+                ],
+                config(),
+            )
+
     @unittest.skipIf(attachment_manifests_expired is None, "falcon is not installed")
     def test_attachment_manifests_expired_rejects_past_or_invalid_ttl(self):
         self.assertTrue(
@@ -218,6 +252,20 @@ class TestAttachments(unittest.TestCase):
                 now=datetime(2026, 6, 14, 1, 0, 0),
             )
         )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_json_parser_rejects_falsey_non_array_attachments(self):
+        class Req:
+            def __init__(self, attachments):
+                self.context = {
+                    "body_raw": b'{"attachments": []}',
+                    "doc": {"attachments": attachments},
+                }
+
+        for attachments in ({}, ""):
+            with self.subTest(attachments=attachments):
+                with self.assertRaises(falcon.HTTPBadRequest):
+                    parse_json_send_request(Req(attachments), config())
 
     def test_local_storage_manifest_and_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
@@ -271,6 +319,43 @@ class TestAttachments(unittest.TestCase):
             self.assertEqual(len(attachments), 1)
             self.assertEqual(attachments[0].get_filename(), "invoice.pdf")
             self.assertEqual(attachments[0].get_content_type(), "application/pdf")
+
+    def test_builds_raw_mime_with_bracketed_content_id(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = config(local_path=root)
+            storage = LocalAttachmentStorage(root)
+            manifests = store_attachments(
+                storage,
+                cfg,
+                "companyid",
+                "messageid",
+                [
+                    AttachmentUpload(
+                        "logo.png",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n",
+                        disposition="inline",
+                        content_id="<logo>",
+                    )
+                ],
+            )
+
+            raw = build_raw_mime_message(
+                "Billing <billing@example.com>",
+                "support@example.com",
+                "Customer <customer@example.com>",
+                "Invoice",
+                '<p><img src="cid:logo"></p>',
+                storage,
+                manifests,
+            )
+            message = BytesParser(policy=default).parsebytes(raw)
+            attachments = list(message.iter_attachments())
+
+            self.assertEqual(manifests[0]["content_id"], "logo")
+            self.assertEqual(attachments[0]["Content-ID"], "<logo>")
+            self.assertEqual(attachments[0].get_filename(), "logo.png")
+            self.assertEqual(attachments[0].get_content_type(), "image/png")
 
     def test_s3_lifecycle_preserves_existing_bucket_rules(self):
         client = FakeS3Client(
@@ -465,6 +550,48 @@ class TestAttachments(unittest.TestCase):
                 "disposition": "inline",
                 "content_id": "logo",
             },
+        )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_multipart_rejects_non_string_attachment_metadata(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p><img src=\"cid:logo\"></p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_field(
+                    boundary,
+                    "attachment_metadata",
+                    json.dumps({"content_id": 0}).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "logo.png",
+                    "image/png",
+                    b"\x89PNG\r\n\x1a\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        resp = self.simulate_multipart_parse(body, boundary, config())
+
+        self.assertEqual(resp.status, "400 Bad Request")
+        self.assertEqual(
+            resp.json["description"],
+            "attachment_metadata content_id must be a string",
         )
 
     @unittest.skipIf(falcon is None, "falcon is not installed")

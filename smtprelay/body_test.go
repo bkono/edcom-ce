@@ -60,7 +60,7 @@ Content-Type: text/html; charset=utf-8
 --boundary
 Content-Type: image/png; name="logo.png"
 Content-Disposition: inline; filename="logo.png"
-Content-ID: <logo>
+Content-ID:  <logo>
 Content-Transfer-Encoding: base64
 
 iVBORw0KGgo=
