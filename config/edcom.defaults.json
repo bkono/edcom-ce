@@ -14,7 +14,25 @@
     "beefree_proxy_url": "https://beefree.emaildelivery.com",
     "beefree_client_id": "",
     "beefree_client_secret": "",
-    "beefree_cs_api_key": ""
+    "beefree_cs_api_key": "",
+    "attachment_enabled": "false",
+    "attachment_storage_backend": "s3",
+    "attachment_s3_bucket": "",
+    "attachment_s3_prefix": "attachments/txn/",
+    "attachment_s3_region": "",
+    "attachment_s3_access_key": "",
+    "attachment_s3_secret_key": "",
+    "attachment_s3_endpoint_url": "",
+    "attachment_local_path": "/buckets/attachments",
+    "attachment_manage_lifecycle": "true",
+    "attachment_ttl_hours": "24",
+    "attachment_lifecycle_expiration_days": "2",
+    "attachment_lifecycle_abort_multipart_days": "1",
+    "attachment_max_count": "5",
+    "attachment_max_file_bytes": "10485760",
+    "attachment_max_total_bytes": "20971520",
+    "attachment_max_mime_bytes": "31457280",
+    "attachment_json_body_max_bytes": "33554432"
   },
   "smtprelay": {
     "smtphost": "your_relay_smtp_hostname"

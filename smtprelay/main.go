@@ -16,8 +16,10 @@ import (
 	"log"
 	"math/big"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/mail"
+	"net/textproto"
 	"os"
 	"strings"
 	"time"
@@ -104,11 +106,12 @@ func mailHandler(peer smtpd.Peer, env smtpd.Envelope) error {
 		return &smtpd.Error{Code: 500, Message: "Could not parse body"}
 	}
 
-	bodystr, err := extractBody(body, email.Header.Get("Content-Type"), email.Header.Get("Content-Transfer-Encoding"))
+	extracted, err := extractMessage(body, email.Header.Get("Content-Type"), email.Header.Get("Content-Transfer-Encoding"))
 	if err != nil {
 		trace.Printf("Error: %s", err)
 		return &smtpd.Error{Code: 500, Message: fmt.Sprintf("Could not parse body: %s", err)}
 	}
+	bodystr := extracted.Body
 
 	subject, _ := dec.DecodeHeader(email.Header.Get("Subject"))
 	if subject == "" {
@@ -165,19 +168,11 @@ func mailHandler(peer smtpd.Peer, env smtpd.Envelope) error {
 			Template:   template,
 			Variables:  vars,
 		}
-		jsonval, err := json.Marshal(&msg)
-		if err != nil {
-			trace.Printf("Error: %s", err)
-			return &smtpd.Error{Code: 451, Message: "Local error in processing: 1"}
-		}
-
-		req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/api/transactional/send", os.Getenv("edcomhost")), bytes.NewBuffer(jsonval))
+		req, err := buildAPIRequest(apikey, msg, extracted.Attachments)
 		if err != nil {
 			trace.Printf("Error: %s", err)
 			return &smtpd.Error{Code: 451, Message: "Local error in processing: 2"}
 		}
-		req.Header.Add("Content-Type", "application/json")
-		req.Header.Add("X-Auth-APIKey", apikey)
 
 		res, err := client.Do(req)
 		if err != nil {
@@ -206,6 +201,66 @@ func mailHandler(peer smtpd.Peer, env smtpd.Envelope) error {
 	}
 	trace.Printf("Success")
 	return nil
+}
+
+func buildAPIRequest(apikey string, msg SendMailMsg, attachments []Attachment) (*http.Request, error) {
+	url := fmt.Sprintf("http://%s/api/transactional/send", os.Getenv("edcomhost"))
+	jsonval, err := json.Marshal(&msg)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(attachments) == 0 {
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonval))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Add("Content-Type", "application/json")
+		req.Header.Add("X-Auth-APIKey", apikey)
+		return req, nil
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("payload", string(jsonval)); err != nil {
+		return nil, err
+	}
+
+	for _, attachment := range attachments {
+		metadata, err := json.Marshal(attachment)
+		if err != nil {
+			return nil, err
+		}
+		if err := writer.WriteField("attachment_metadata", string(metadata)); err != nil {
+			return nil, err
+		}
+
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{
+			"name":     "attachment",
+			"filename": attachment.Filename,
+		}))
+		header.Set("Content-Type", attachment.ContentType)
+		part, err := writer.CreatePart(header)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := part.Write(attachment.Data); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", url, &body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Content-Type", writer.FormDataContentType())
+	req.Header.Add("X-Auth-APIKey", apikey)
+	return req, nil
 }
 
 func fileExists(filename string) bool {
@@ -329,6 +384,7 @@ func main() {
 		WriteTimeout:   60 * time.Second,
 		DataTimeout:    60 * time.Second,
 		MaxConnections: 500,
+		MaxMessageSize: 30 * 1024 * 1024,
 		Handler:        mailHandler,
 		Authenticator:  authHandler,
 		ForceTLS:       false,

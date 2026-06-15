@@ -1,0 +1,761 @@
+import base64
+from datetime import datetime
+from email.parser import BytesParser
+from email.policy import default
+import json
+import os
+import tempfile
+import unittest
+from unittest.mock import patch
+
+try:
+    import falcon
+    from falcon import testing
+    from api.shared.send import do_ses_send_task, possible_backend_types
+    from api.transactional import (
+        attachment_manifests_expired,
+        parse_json_send_request,
+        parse_multipart_send_request,
+    )
+except ModuleNotFoundError:
+    falcon = None
+    testing = None
+    do_ses_send_task = None
+    possible_backend_types = None
+    attachment_manifests_expired = None
+    parse_json_send_request = None
+    parse_multipart_send_request = None
+
+from api.shared.attachments import (
+    ATTACHMENT_LIFECYCLE_RULE_ID,
+    AttachmentConfig,
+    AttachmentDisabledError,
+    AttachmentError,
+    AttachmentUpload,
+    LocalAttachmentStorage,
+    S3AttachmentStorage,
+    build_raw_mime_message,
+    decode_json_attachment,
+    delete_attachments,
+    store_attachments,
+    validate_attachment_collection,
+)
+
+
+def multipart_field(boundary, name, value, content_type=None):
+    headers = [
+        "--%s" % boundary,
+        'Content-Disposition: form-data; name="%s"' % name,
+    ]
+    if content_type:
+        headers.append("Content-Type: %s" % content_type)
+    return ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8") + value + b"\r\n"
+
+
+def multipart_file(boundary, name, filename, content_type, value):
+    headers = [
+        "--%s" % boundary,
+        'Content-Disposition: form-data; name="%s"; filename="%s"' % (name, filename),
+        "Content-Type: %s" % content_type,
+    ]
+    return ("\r\n".join(headers) + "\r\n\r\n").encode("utf-8") + value + b"\r\n"
+
+
+def config(**overrides):
+    values = {
+        "enabled": True,
+        "storage_backend": "local",
+        "s3_bucket": "",
+        "s3_prefix": "attachments/txn/",
+        "s3_region": "",
+        "s3_access_key": "",
+        "s3_secret_key": "",
+        "s3_endpoint_url": "",
+        "local_path": "/tmp/edcom-attachments-test",
+        "manage_lifecycle": True,
+        "ttl_hours": 24,
+        "lifecycle_expiration_days": 2,
+        "lifecycle_abort_multipart_days": 1,
+        "max_count": 5,
+        "max_file_bytes": 10 * 1024 * 1024,
+        "max_total_bytes": 20 * 1024 * 1024,
+        "max_mime_bytes": 30 * 1024 * 1024,
+        "json_body_max_bytes": 32 * 1024 * 1024,
+    }
+    values.update(overrides)
+    return AttachmentConfig(**values)
+
+
+class NoSuchLifecycleConfiguration(Exception):
+    response = {"Error": {"Code": "NoSuchLifecycleConfiguration"}}
+
+
+class FakeS3Client:
+    def __init__(self, lifecycle=None):
+        self.lifecycle = lifecycle
+        self.put_lifecycle = None
+
+    def get_bucket_lifecycle_configuration(self, Bucket):
+        if self.lifecycle is None:
+            raise NoSuchLifecycleConfiguration()
+        return self.lifecycle
+
+    def put_bucket_lifecycle_configuration(self, Bucket, LifecycleConfiguration):
+        self.put_lifecycle = LifecycleConfiguration
+
+
+class TestAttachments(unittest.TestCase):
+    def test_rejects_attachments_when_disabled(self):
+        upload = AttachmentUpload("invoice.pdf", "application/pdf", b"%PDF-1.7\n")
+
+        with self.assertRaises(AttachmentDisabledError):
+            validate_attachment_collection([upload], config(enabled=False))
+
+    def test_requires_extension_to_match_content_type(self):
+        upload = AttachmentUpload("invoice.pdf", "image/png", b"%PDF-1.7\n")
+
+        with self.assertRaises(AttachmentError):
+            validate_attachment_collection([upload], config())
+
+    def test_validates_binary_signature(self):
+        upload = AttachmentUpload("invoice.pdf", "application/pdf", b"not a pdf")
+
+        with self.assertRaises(AttachmentError):
+            validate_attachment_collection([upload], config())
+
+    def test_allows_mp4_compatible_brand_signature(self):
+        data = (
+            b"\x00\x00\x00\x20"
+            b"ftyp"
+            b"m4v "
+            b"\x00\x00\x00\x00"
+            b"isom"
+            b"mp42"
+            b"avc1"
+            b"\x00\x00\x00\x00"
+        )
+
+        validate_attachment_collection(
+            [AttachmentUpload("clip.mp4", "video/mp4", data)],
+            config(),
+        )
+
+    def test_allows_utf8_markdown(self):
+        upload = AttachmentUpload(
+            "notes.md",
+            "text/markdown",
+            "# Invoice\n\nAttached payment notes.\n".encode("utf-8"),
+        )
+
+        validate_attachment_collection([upload], config())
+
+    def test_rejects_unsupported_archive(self):
+        upload = AttachmentUpload("payload.gz", "application/gzip", b"\x1f\x8b")
+
+        with self.assertRaises(AttachmentError):
+            validate_attachment_collection([upload], config())
+
+    def test_enforces_total_size_limit(self):
+        uploads = [
+            AttachmentUpload("a.txt", "text/plain", b"a" * 6),
+            AttachmentUpload("b.txt", "text/plain", b"b" * 6),
+        ]
+
+        with self.assertRaises(AttachmentError):
+            validate_attachment_collection(uploads, config(max_total_bytes=10))
+
+    def test_decodes_json_base64_attachment(self):
+        upload = decode_json_attachment(
+            {
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "content": base64.b64encode(b"%PDF-1.7\n").decode("ascii"),
+            },
+            config(),
+        )
+
+        self.assertEqual(upload.filename, "invoice.pdf")
+        self.assertEqual(upload.data, b"%PDF-1.7\n")
+
+    def test_rejects_non_object_json_attachment(self):
+        with self.assertRaises(AttachmentError):
+            decode_json_attachment(None, config())
+
+    def test_rejects_non_string_json_attachment_content(self):
+        with self.assertRaises(AttachmentError):
+            decode_json_attachment(
+                {
+                    "filename": "invoice.pdf",
+                    "content_type": "application/pdf",
+                    "content": None,
+                },
+                config(),
+            )
+
+    def test_rejects_non_string_json_attachment_fields(self):
+        for field in ["filename", "content_type", "disposition", "content_id"]:
+            item = {
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "content": base64.b64encode(b"%PDF-1.7\n").decode("ascii"),
+            }
+            item[field] = 123
+            with self.subTest(field=field):
+                with self.assertRaises(AttachmentError):
+                    decode_json_attachment(item, config())
+
+    def test_json_attachment_allows_nullable_content_id(self):
+        upload = decode_json_attachment(
+            {
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "content": base64.b64encode(b"%PDF-1.7\n").decode("ascii"),
+                "content_id": None,
+            },
+            config(),
+        )
+
+        self.assertIsNone(upload.content_id)
+
+    def test_rejects_invalid_content_id(self):
+        with self.assertRaises(AttachmentError):
+            validate_attachment_collection(
+                [
+                    AttachmentUpload(
+                        "logo.png",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n",
+                        disposition="inline",
+                        content_id="bad\r\nid",
+                    )
+                ],
+                config(),
+            )
+
+    @unittest.skipIf(attachment_manifests_expired is None, "falcon is not installed")
+    def test_attachment_manifests_expired_rejects_past_or_invalid_ttl(self):
+        self.assertTrue(
+            attachment_manifests_expired(
+                [{"expires_at": "2026-06-14T00:00:00Z"}],
+                now=datetime(2026, 6, 14, 1, 0, 0),
+            )
+        )
+        self.assertTrue(
+            attachment_manifests_expired(
+                [{"expires_at": "not-a-timestamp"}],
+                now=datetime(2026, 6, 14, 1, 0, 0),
+            )
+        )
+        self.assertFalse(
+            attachment_manifests_expired(
+                [{"expires_at": "2026-06-14T02:00:00Z"}],
+                now=datetime(2026, 6, 14, 1, 0, 0),
+            )
+        )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_json_parser_rejects_falsey_non_array_attachments(self):
+        class Req:
+            def __init__(self, attachments):
+                self.context = {
+                    "body_raw": b'{"attachments": []}',
+                    "doc": {"attachments": attachments},
+                }
+
+        for attachments in ({}, ""):
+            with self.subTest(attachments=attachments):
+                with self.assertRaises(falcon.HTTPBadRequest):
+                    parse_json_send_request(Req(attachments), config())
+
+    def test_local_storage_manifest_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = config(local_path=root)
+            storage = LocalAttachmentStorage(root)
+            upload = AttachmentUpload(
+                "invoice.pdf", "application/pdf", b"%PDF-1.7\n"
+            )
+
+            manifests = store_attachments(
+                storage, cfg, "companyid", "messageid", [upload]
+            )
+
+            self.assertEqual(len(manifests), 1)
+            manifest = manifests[0]
+            self.assertEqual(manifest["storage_backend"], "local")
+            self.assertEqual(manifest["filename"], "invoice.pdf")
+            self.assertEqual(manifest["content_type"], "application/pdf")
+            self.assertTrue(storage.exists(manifest))
+            with storage.open_read(manifest) as fp:
+                self.assertEqual(fp.read(), b"%PDF-1.7\n")
+
+            delete_attachments(storage, manifests)
+            self.assertFalse(os.path.exists(os.path.join(root, manifest["key"])))
+
+    def test_builds_raw_mime_with_attachment(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = config(local_path=root)
+            storage = LocalAttachmentStorage(root)
+            manifests = store_attachments(
+                storage,
+                cfg,
+                "companyid",
+                "messageid",
+                [AttachmentUpload("invoice.pdf", "application/pdf", b"%PDF-1.7\n")],
+            )
+
+            raw = build_raw_mime_message(
+                "Billing <billing@example.com>",
+                "support@example.com",
+                "Customer <customer@example.com>",
+                "Invoice",
+                "<p>Attached.</p>",
+                storage,
+                manifests,
+            )
+            message = BytesParser(policy=default).parsebytes(raw)
+            attachments = list(message.iter_attachments())
+
+            self.assertEqual(message["Subject"], "Invoice")
+            self.assertEqual(len(attachments), 1)
+            self.assertEqual(attachments[0].get_filename(), "invoice.pdf")
+            self.assertEqual(attachments[0].get_content_type(), "application/pdf")
+
+    def test_builds_raw_mime_with_bracketed_content_id(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = config(local_path=root)
+            storage = LocalAttachmentStorage(root)
+            manifests = store_attachments(
+                storage,
+                cfg,
+                "companyid",
+                "messageid",
+                [
+                    AttachmentUpload(
+                        "logo.png",
+                        "image/png",
+                        b"\x89PNG\r\n\x1a\n",
+                        disposition="inline",
+                        content_id="<logo>",
+                    )
+                ],
+            )
+
+            raw = build_raw_mime_message(
+                "Billing <billing@example.com>",
+                "support@example.com",
+                "Customer <customer@example.com>",
+                "Invoice",
+                '<p><img src="cid:logo"></p>',
+                storage,
+                manifests,
+            )
+            message = BytesParser(policy=default).parsebytes(raw)
+            attachments = list(message.iter_attachments())
+
+            self.assertEqual(manifests[0]["content_id"], "logo")
+            self.assertEqual(attachments[0]["Content-ID"], "<logo>")
+            self.assertEqual(attachments[0].get_filename(), "logo.png")
+            self.assertEqual(attachments[0].get_content_type(), "image/png")
+
+    def test_s3_lifecycle_preserves_existing_bucket_rules(self):
+        client = FakeS3Client(
+            {
+                "Rules": [
+                    {
+                        "ID": "keep-other-prefix",
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": "other/"},
+                        "Expiration": {"Days": 30},
+                    },
+                    {
+                        "ID": ATTACHMENT_LIFECYCLE_RULE_ID,
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": "old/"},
+                        "Expiration": {"Days": 9},
+                    },
+                ]
+            }
+        )
+        storage = S3AttachmentStorage.__new__(S3AttachmentStorage)
+        storage.bucket = "bucket"
+        storage.client = client
+
+        storage.configure_lifecycle("attachments/txn/", 2, 1)
+
+        rules = client.put_lifecycle["Rules"]
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(rules[0]["ID"], "keep-other-prefix")
+        self.assertEqual(rules[0]["Filter"], {"Prefix": "other/"})
+        self.assertEqual(rules[1]["ID"], ATTACHMENT_LIFECYCLE_RULE_ID)
+        self.assertEqual(rules[1]["Filter"], {"Prefix": "attachments/txn/"})
+        self.assertEqual(rules[1]["Expiration"], {"Days": 2})
+
+    def test_s3_lifecycle_creates_attachment_rule_when_bucket_has_no_lifecycle(self):
+        client = FakeS3Client()
+        storage = S3AttachmentStorage.__new__(S3AttachmentStorage)
+        storage.bucket = "bucket"
+        storage.client = client
+
+        storage.configure_lifecycle("attachments/txn/", 2, 1)
+
+        self.assertEqual(
+            client.put_lifecycle["Rules"][0]["ID"],
+            ATTACHMENT_LIFECYCLE_RULE_ID,
+        )
+
+    @unittest.skipIf(do_ses_send_task is None, "send dependencies are not installed")
+    def test_ses_task_accepts_pre_attachment_positional_args(self):
+        captured = {}
+
+        def fake_do_ses_send(*args):
+            captured["args"] = args
+
+        task_callable = getattr(do_ses_send_task, "run", do_ses_send_task)
+        with patch("api.shared.send.do_ses_send", fake_do_ses_send):
+            task_callable(
+                {"id": "ses"},
+                "from@example.com",
+                "reply@example.com",
+                "campid",
+                "campcid",
+                False,
+                [],
+                None,
+                {},
+                False,
+                "htmlkey",
+                "subject",
+                True,
+            )
+
+        self.assertIs(captured["args"][-2], True)
+        self.assertIsNone(captured["args"][-1])
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_parses_falcon_streamed_multipart_payload_and_attachment(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p>Attached.</p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "invoice.pdf",
+                    "application/pdf",
+                    b"%PDF-1.7\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        class Resource:
+            def on_post(self, req, resp):
+                doc, uploads = parse_multipart_send_request(req, config())
+                resp.media = {
+                    "subject": doc["subject"],
+                    "filename": uploads[0].filename,
+                    "content_type": uploads[0].content_type,
+                    "size": len(uploads[0].data),
+                }
+
+        app = falcon.App()
+        app.add_route("/send", Resource())
+        client = testing.TestClient(app)
+        resp = client.simulate_post(
+            "/send",
+            body=body,
+            headers={"content-type": "multipart/form-data; boundary=%s" % boundary},
+        )
+
+        self.assertEqual(resp.status, "200 OK")
+        self.assertEqual(
+            resp.json,
+            {
+                "subject": "Invoice",
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "size": 9,
+            },
+        )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_parses_multipart_attachment_metadata(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p><img src=\"cid:logo\"></p>",
+        }
+        metadata = {"disposition": "inline", "content_id": "<logo>"}
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_field(
+                    boundary,
+                    "attachment_metadata",
+                    json.dumps(metadata).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "logo.png",
+                    "image/png",
+                    b"\x89PNG\r\n\x1a\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        class Resource:
+            def on_post(self, req, resp):
+                doc, uploads = parse_multipart_send_request(req, config())
+                resp.media = {
+                    "subject": doc["subject"],
+                    "disposition": uploads[0].disposition,
+                    "content_id": uploads[0].content_id,
+                }
+
+        app = falcon.App()
+        app.add_route("/send", Resource())
+        client = testing.TestClient(app)
+        resp = client.simulate_post(
+            "/send",
+            body=body,
+            headers={"content-type": "multipart/form-data; boundary=%s" % boundary},
+        )
+
+        self.assertEqual(resp.status, "200 OK")
+        self.assertEqual(
+            resp.json,
+            {
+                "subject": "Invoice",
+                "disposition": "inline",
+                "content_id": "logo",
+            },
+        )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_multipart_rejects_non_string_attachment_metadata(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p><img src=\"cid:logo\"></p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_field(
+                    boundary,
+                    "attachment_metadata",
+                    json.dumps({"content_id": 0}).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "logo.png",
+                    "image/png",
+                    b"\x89PNG\r\n\x1a\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        resp = self.simulate_multipart_parse(body, boundary, config())
+
+        self.assertEqual(resp.status, "400 Bad Request")
+        self.assertEqual(
+            resp.json["description"],
+            "attachment_metadata content_id must be a string",
+        )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_multipart_rejects_too_many_parts_before_buffering_extra_file(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p>Attached.</p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "first.pdf",
+                    "application/pdf",
+                    b"%PDF-1.7\n",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "second.pdf",
+                    "application/pdf",
+                    b"%PDF-1.7\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        resp = self.simulate_multipart_parse(body, boundary, config(max_count=1))
+
+        self.assertEqual(resp.status, "400 Bad Request")
+        self.assertIn("Too many attachments", resp.text)
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_multipart_rejects_total_size_before_buffering_past_limit(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p>Attached.</p>",
+        }
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "first.txt",
+                    "text/plain",
+                    b"123456",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "second.txt",
+                    "text/plain",
+                    b"123456",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        resp = self.simulate_multipart_parse(body, boundary, config(max_total_bytes=10))
+
+        self.assertEqual(resp.status, "400 Bad Request")
+        self.assertIn("Attachments exceed maximum total size", resp.text)
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_route_backend_types_stop_after_first_routable_matching_rule(self):
+        route = {
+            "published": {
+                "rules": [
+                    {
+                        "domaingroup": "ses-only",
+                        "splits": [{"pct": 100, "policy": "ses-1"}],
+                    },
+                    {
+                        "domaingroup": "",
+                        "splits": [{"pct": 100, "policy": "mailgun-1"}],
+                    },
+                ]
+            }
+        }
+
+        backend_types = possible_backend_types(
+            route,
+            "customer@example.com",
+            {"ses-only": {"domains": "example.com"}},
+            {},
+            {},
+            {"mailgun-1": {"id": "mailgun-1"}},
+            {"ses-1": {"id": "ses-1"}},
+            {},
+            {},
+            {},
+        )
+
+        self.assertEqual(backend_types, {"ses"})
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_route_backend_types_keep_all_possibilities_in_first_routable_rule(self):
+        route = {
+            "published": {
+                "rules": [
+                    {
+                        "domaingroup": "",
+                        "splits": [
+                            {"pct": 50, "policy": "ses-1"},
+                            {"pct": 50, "policy": "mailgun-1"},
+                        ],
+                    },
+                    {
+                        "domaingroup": "",
+                        "splits": [{"pct": 100, "policy": "ses-2"}],
+                    },
+                ]
+            }
+        }
+
+        backend_types = possible_backend_types(
+            route,
+            "customer@example.com",
+            {},
+            {},
+            {},
+            {"mailgun-1": {"id": "mailgun-1"}},
+            {"ses-1": {"id": "ses-1"}, "ses-2": {"id": "ses-2"}},
+            {},
+            {},
+            {},
+        )
+
+        self.assertEqual(backend_types, {"ses", "mailgun"})
+
+    def simulate_multipart_parse(self, body, boundary, cfg):
+        class Resource:
+            def on_post(self, req, resp):
+                parse_multipart_send_request(req, cfg)
+                resp.media = {"ok": True}
+
+        app = falcon.App()
+        app.add_route("/send", Resource())
+        client = testing.TestClient(app)
+        return client.simulate_post(
+            "/send",
+            body=body,
+            headers={"content-type": "multipart/form-data; boundary=%s" % boundary},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -43,6 +43,12 @@ from .utils import (
 from xml.sax.saxutils import escape
 from .tasks import tasks, LOW_PRIORITY
 from .s3 import s3_read, s3_delete, s3_write, s3_read_stream
+from .attachments import (
+    AttachmentManifest,
+    build_attachment_storage,
+    build_raw_mime_message,
+    get_attachment_config,
+)
 from . import contacts
 from .log import get_logger
 from .webhooks import send_webhooks
@@ -707,6 +713,123 @@ def choose_backend(
     return obj, settingsid
 
 
+def possible_backend_types(
+    route: JsonObj,
+    toaddr: str,
+    domaingroups: Dict[str, JsonObj],
+    policies: Dict[str, JsonObj],
+    sinks: Dict[str, JsonObj],
+    mailgun: Dict[str, JsonObj],
+    ses: Dict[str, JsonObj],
+    sparkpost: Dict[str, JsonObj],
+    easylink: Dict[str, JsonObj],
+    smtprelays: Dict[str, JsonObj],
+) -> Set[str]:
+    backend_types: Set[str] = set()
+    domain = toaddr.split("@")[1]
+
+    for rule in route["published"]["rules"]:
+        rule_matches = False
+        if not rule["domaingroup"]:
+            rule_matches = True
+        else:
+            dg = domaingroups.get(rule["domaingroup"], None)
+            if dg is None:
+                continue
+            for dg_domain in dg["domains"].split():
+                if fnmatch(domain, dg_domain):
+                    rule_matches = True
+                    break
+        if not rule_matches:
+            continue
+
+        rule_backend_types: Set[str] = set()
+        for split in rule["splits"]:
+            policyid = split.get("policy")
+            if not policyid:
+                continue
+            if policyid in mailgun:
+                rule_backend_types.add("mailgun")
+                continue
+            if policyid in ses:
+                rule_backend_types.add("ses")
+                continue
+            if policyid in sparkpost:
+                rule_backend_types.add("sparkpost")
+                continue
+            if policyid in easylink:
+                rule_backend_types.add("easylink")
+                continue
+            if policyid in smtprelays:
+                rule_backend_types.add("smtprelay")
+                continue
+
+            policy = policies.get(policyid, None)
+            if policy is None or policy.get("published", None) is None:
+                continue
+            published = policy["published"]
+            policy_matches = False
+            for policy_domain in published["domains"].split():
+                if fnmatch(domain, policy_domain):
+                    policy_matches = True
+                    break
+            if not policy_matches:
+                continue
+
+            for sink in published["sinks"]:
+                if sink["sink"] in sinks:
+                    rule_backend_types.add("sink")
+
+        if rule_backend_types:
+            return rule_backend_types
+
+    return backend_types
+
+
+def route_backend_types_for_recipient(db: DB, route: JsonObj, toaddr: str) -> Set[str]:
+    domaingroups = {}
+    policies = {}
+    sinks = {}
+    mailgun = {}
+    ses = {}
+    sparkpost = {}
+    easylink = {}
+    smtprelays = {}
+    oldcid = db.get_cid()
+    db.set_cid(route["cid"])
+    try:
+        for dg in db.domaingroups.find():
+            domaingroups[dg["id"]] = dg
+        for p in db.policies.find():
+            policies[p["id"]] = p
+        for s in db.sinks.find():
+            sinks[s["id"]] = s
+        for m in db.mailgun.find():
+            mailgun[m["id"]] = m
+        for s in db.ses.find():
+            ses[s["id"]] = s
+        for s in db.sparkpost.find():
+            sparkpost[s["id"]] = s
+        for s in db.easylink.find():
+            easylink[s["id"]] = s
+        for s in db.smtprelays.find():
+            smtprelays[s["id"]] = s
+        return possible_backend_types(
+            route,
+            toaddr,
+            domaingroups,
+            policies,
+            sinks,
+            mailgun,
+            ses,
+            sparkpost,
+            easylink,
+            smtprelays,
+        )
+    finally:
+        db.set_cid(oldcid)
+
+
 def get_frontend_params(
     db: DB, usercid: str
 ) -> Tuple[bool, str, str, str, str, str, bool]:
@@ -862,6 +985,7 @@ def send_backend_mail(
     subject: str,
     campid: str = "test",
     toname: str | None = None,
+    attachments: List[AttachmentManifest] | None = None,
     raise_err: bool = False,
 ) -> bool:
     demo, imagebucket, bodydomain, headers, fromencoding, subjectencoding, usedkim = (
@@ -918,6 +1042,11 @@ def send_backend_mail(
             "You must delete Drop All Mail from your postal route to send this message"
         )
 
+    if attachments and settingsid != "ses":
+        raise Exception(
+            "Transactional attachments are only supported for SES postal routes"
+        )
+
     if settingsid == "mailgun":
         clientdomain = db.single(
             "select data->>'name' from clientdkim where data->>'name' = %s and cid = %s and data->'mgentry' is not null and data->'mgentry'->>'id' = %s",
@@ -953,6 +1082,7 @@ def send_backend_mail(
             True,
             recips=[{"Email": toaddr, "!!to": to}],
             sync=True,
+            attachments=attachments,
             raise_err=raise_err,
         )
         return False
@@ -1312,6 +1442,7 @@ def do_ses_send_task(
     htmlkey: str,
     subject: str,
     raise_err: bool,
+    attachments: List[AttachmentManifest] | None = None,
 ) -> None:
     do_ses_send(
         ses,
@@ -1327,6 +1458,7 @@ def do_ses_send_task(
         htmlkey,
         subject,
         raise_err,
+        attachments,
     )
 
 
@@ -1344,6 +1476,7 @@ def do_ses_send(
     htmlkey: str,
     subject: str,
     raise_err: bool,
+    attachments: List[AttachmentManifest] | None = None,
 ) -> None:
     stream = None
     try:
@@ -1369,6 +1502,10 @@ def do_ses_send(
 
             if recips is None:
                 recips = []
+
+            attachment_storage = None
+            if attachments:
+                attachment_storage = build_attachment_storage(get_attachment_config())
 
             for r in recips:
                 if "!!to" in r:
@@ -1424,7 +1561,29 @@ def do_ses_send(
                     },
                 )
                 try:
-                    status = sesclient.send_email(**kwargs)
+                    if attachments and attachment_storage is not None:
+                        log.info(
+                            "sending SES raw transactional message with %s attachments cid=%s campid=%s",
+                            len(attachments),
+                            campcid,
+                            campid,
+                        )
+                        raw_message = build_raw_mime_message(
+                            frm,
+                            replyto,
+                            to,
+                            subjectreplaced,
+                            htmlreplaced,
+                            attachment_storage,
+                            attachments,
+                        )
+                        status = sesclient.send_raw_email(
+                            Source=frm,
+                            Destinations=[to],
+                            RawMessage={"Data": raw_message},
+                        )
+                    else:
+                        status = sesclient.send_email(**kwargs)
                 except Exception as e:
                     error = str(e)
 
@@ -2735,6 +2894,7 @@ def ses_send(
     recipkey: str | None = None,
     sync: bool = False,
     write_err: bool = False,
+    attachments: List[AttachmentManifest] | None = None,
     raise_err: bool = False,
 ) -> None:
     domain: str = ses["domain"]
@@ -2787,6 +2947,7 @@ def ses_send(
             htmlkey,
             subject,
             raise_err,
+            attachments,
         )
     else:
         if recips is not None:
@@ -2806,6 +2967,7 @@ def ses_send(
             htmlkey,
             subject,
             raise_err,
+            attachments,
         )
 
 

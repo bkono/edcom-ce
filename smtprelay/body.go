@@ -15,7 +15,60 @@ import (
 	"golang.org/x/net/html/charset"
 )
 
+type Attachment struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Data        []byte `json:"-"`
+	Disposition string `json:"disposition,omitempty"`
+	ContentID   string `json:"content_id,omitempty"`
+}
+
+type extractedMessage struct {
+	HTML        string
+	Text        string
+	HasHTML     bool
+	HasText     bool
+	Attachments []Attachment
+}
+
 func extractBody(body []byte, contentType, contentTransferEncoding string) (string, error) {
+	msg, err := extractMessage(body, contentType, contentTransferEncoding)
+	if err != nil {
+		return "", err
+	}
+	return msg.Body, nil
+}
+
+func extractMessage(body []byte, contentType, contentTransferEncoding string) (struct {
+	Body        string
+	Attachments []Attachment
+}, error) {
+	msg, err := extractMessageParts(body, contentType, contentTransferEncoding)
+	if err != nil {
+		return struct {
+			Body        string
+			Attachments []Attachment
+		}{}, err
+	}
+	if msg.HasHTML {
+		return struct {
+			Body        string
+			Attachments []Attachment
+		}{Body: msg.HTML, Attachments: msg.Attachments}, nil
+	}
+	if msg.HasText {
+		return struct {
+			Body        string
+			Attachments []Attachment
+		}{Body: msg.Text, Attachments: msg.Attachments}, nil
+	}
+	return struct {
+		Body        string
+		Attachments []Attachment
+	}{}, errors.New("no valid HTML or plain text body found")
+}
+
+func extractMessageParts(body []byte, contentType, contentTransferEncoding string) (extractedMessage, error) {
 	mediaType := "text/html"
 	var params map[string]string
 	var err error
@@ -23,21 +76,21 @@ func extractBody(body []byte, contentType, contentTransferEncoding string) (stri
 	if contentType != "" {
 		mediaType, params, err = mime.ParseMediaType(contentType)
 		if err != nil {
-			return "", err
+			return extractedMessage{}, err
 		}
 	}
 
 	mediaType = strings.ToLower(mediaType)
 	contentTransferEncoding = strings.ToLower(contentTransferEncoding)
 
-	if (mediaType == "multipart/alternative" || mediaType == "multipart/mixed") &&
+	if (mediaType == "multipart/alternative" || mediaType == "multipart/mixed" || mediaType == "multipart/related") &&
 		(contentTransferEncoding == "quoted-printable" || contentTransferEncoding == "base64") {
-		return "", errors.New("Cannot use a content transfer encoding with a multipart body")
+		return extractedMessage{}, errors.New("Cannot use a content transfer encoding with a multipart body")
 	}
 
 	body, err = decodeContentTransfer(body, contentTransferEncoding)
 	if err != nil {
-		return "", err
+		return extractedMessage{}, err
 	}
 
 	charset, ok := params["charset"]
@@ -47,18 +100,25 @@ func extractBody(body []byte, contentType, contentTransferEncoding string) (stri
 
 	switch mediaType {
 	case "text/plain", "text/html":
-		return decodeCharset(body, charset)
-	case "multipart/alternative", "multipart/mixed":
-		return parseMultipartBody(body, params["boundary"])
+		decoded, err := decodeCharset(body, charset)
+		if err != nil {
+			return extractedMessage{}, err
+		}
+		if mediaType == "text/html" {
+			return extractedMessage{HTML: decoded, HasHTML: true}, nil
+		}
+		return extractedMessage{Text: decoded, HasText: true}, nil
+	case "multipart/alternative", "multipart/mixed", "multipart/related":
+		return parseMultipartMessage(body, params["boundary"])
 	default:
-		return "", errors.New("unsupported content type")
+		return extractedMessage{}, errors.New("unsupported content type")
 	}
 }
 
 func decodeContentTransfer(body []byte, contentTransferEncoding string) ([]byte, error) {
 	switch contentTransferEncoding {
 	case "base64":
-		return base64.StdEncoding.DecodeString(string(body))
+		return ioutil.ReadAll(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(body)))
 	case "quoted-printable":
 		return ioutil.ReadAll(quotedprintable.NewReader(bytes.NewReader(body)))
 	default:
@@ -91,63 +151,117 @@ func decodeCharset(body []byte, label string) (string, error) {
 }
 
 func parseMultipartBody(body []byte, boundary string) (string, error) {
+	msg, err := parseMultipartMessage(body, boundary)
+	if err != nil {
+		return "", err
+	}
+	if msg.HasHTML {
+		return msg.HTML, nil
+	}
+	if msg.HasText {
+		return msg.Text, nil
+	}
+	return "", errors.New("no valid HTML or plain text part found in multipart body")
+}
+
+func parseMultipartMessage(body []byte, boundary string) (extractedMessage, error) {
 	r := multipart.NewReader(bytes.NewReader(body), boundary)
 
-	var textPart string
-	var hasText bool
+	var msg extractedMessage
 	for {
 		p, err := r.NextPart()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return "", err
+			return extractedMessage{}, err
 		}
 		partBody, err := ioutil.ReadAll(p)
 		if err != nil {
-			return "", err
+			return extractedMessage{}, err
 		}
 
 		contentType := p.Header.Get("Content-Type")
 		contentTransferEncoding := p.Header.Get("Content-Transfer-Encoding")
+		filename := p.FileName()
 
 		mediaType := "text/plain"
+		var params map[string]string
 
 		if contentType != "" {
-			mediaType, _, err = mime.ParseMediaType(contentType)
+			mediaType, params, err = mime.ParseMediaType(contentType)
 			if err != nil {
-				return "", err
+				return extractedMessage{}, err
 			}
 		}
 
 		mediaType = strings.ToLower(mediaType)
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+
+		if filename == "" && params != nil {
+			filename = params["name"]
+		}
+		if filename != "" {
+			decodedBody, err := decodeContentTransfer(partBody, strings.ToLower(contentTransferEncoding))
+			if err != nil {
+				return extractedMessage{}, err
+			}
+			disposition := "attachment"
+			if dispositionHeader := p.Header.Get("Content-Disposition"); dispositionHeader != "" {
+				if dispositionType, _, err := mime.ParseMediaType(dispositionHeader); err == nil && strings.ToLower(dispositionType) == "inline" {
+					disposition = "inline"
+				}
+			}
+			contentID := strings.Trim(strings.TrimSpace(p.Header.Get("Content-ID")), "<>")
+			msg.Attachments = append(msg.Attachments, Attachment{
+				Filename:    filename,
+				ContentType: mediaType,
+				Data:        decodedBody,
+				Disposition: disposition,
+				ContentID:   contentID,
+			})
+			continue
+		}
 
 		switch strings.ToLower(mediaType) {
 		case "text/plain":
-			decodedBody, err := extractBody(partBody, contentType, contentTransferEncoding)
+			decodedBody, err := extractMessageParts(partBody, contentType, contentTransferEncoding)
 			if err != nil {
 				trace.Printf("Error decoding text: %s", err)
-			} else if !hasText {
-				textPart = decodedBody
-				hasText = true
+			} else if decodedBody.HasText && !msg.HasText {
+				msg.Text = decodedBody.Text
+				msg.HasText = true
 			}
 		case "text/html":
-			decodedBody, err := extractBody(partBody, contentType, contentTransferEncoding)
+			decodedBody, err := extractMessageParts(partBody, contentType, contentTransferEncoding)
 			if err != nil {
 				trace.Printf("Error decoding HTML: %s", err)
 			} else {
-				return decodedBody, nil
+				if decodedBody.HasHTML {
+					msg.HTML = decodedBody.HTML
+					msg.HasHTML = true
+				}
 			}
-		case "multipart/alternative", "multipart/mixed":
-			decodedBody, err := extractBody(partBody, contentType, contentTransferEncoding)
+		case "multipart/alternative", "multipart/mixed", "multipart/related":
+			decodedBody, err := extractMessageParts(partBody, contentType, contentTransferEncoding)
 			if err == nil {
-				return decodedBody, nil
+				if decodedBody.HasHTML {
+					msg.HTML = decodedBody.HTML
+					msg.HasHTML = true
+				}
+				if decodedBody.HasText && !msg.HasText {
+					msg.Text = decodedBody.Text
+					msg.HasText = true
+				}
+				msg.Attachments = append(msg.Attachments, decodedBody.Attachments...)
 			}
 		}
 	}
 
-	if hasText {
-		return textPart, nil
+	if msg.HasHTML || msg.HasText || len(msg.Attachments) > 0 {
+		return msg, nil
 	}
-	return "", errors.New("no valid HTML or plain text part found in multipart body")
+	return extractedMessage{}, errors.New("no valid HTML or plain text part found in multipart body")
 }

@@ -4,6 +4,7 @@
 * * * * * /scripts/cron.py api.funnels check_funnels 12
 * * * * * /scripts/cron.py api.transactional check_txns 14
 * * * * * /scripts/cron.py api.campaigns check_camps 16
+*/30 * * * * /scripts/cron.py api.transactional cleanup_expired_txn_attachments 18
 30 * * * * /scripts/cron.py api.lists refresh_active_counts 20
 * * * * * /scripts/cron.py api.lists check_list_validations 24
 0 0 * * * /usr/sbin/logrotate /etc/logrotate.conf -s /config/logrotate.status

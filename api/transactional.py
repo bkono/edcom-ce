@@ -8,6 +8,7 @@ import email.utils
 import traceback
 import csv
 import zipfile
+from typing import Any, List, Tuple
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
 from email.utils import formataddr, parseaddr
@@ -29,6 +30,18 @@ from .shared.send import (
     check_send_limit,
     check_test_limit,
     load_domain_throttles,
+    route_backend_types_for_recipient,
+)
+from .shared.attachments import (
+    AttachmentError,
+    AttachmentUpload,
+    build_attachment_storage,
+    decode_json_attachment,
+    delete_attachments,
+    get_attachment_config,
+    read_limited_stream,
+    store_attachments,
+    validate_attachment_collection,
 )
 from .shared.db import json_iter, open_db, JsonObj
 from .shared.tasks import tasks, LOW_PRIORITY, HIGH_PRIORITY
@@ -452,6 +465,243 @@ class TagMessages(object):
         ]
 
 
+def parse_send_request(
+    req: falcon.Request,
+) -> Tuple[JsonObj, List[AttachmentUpload]]:
+    content_type = req.content_type or ""
+    config = get_attachment_config()
+    if content_type.startswith("multipart/form-data"):
+        return parse_multipart_send_request(req, config)
+    return parse_json_send_request(req, config)
+
+
+def parse_json_send_request(
+    req: falcon.Request,
+    config: Any,
+) -> Tuple[JsonObj, List[AttachmentUpload]]:
+    doc = req.context.get("doc")
+    if not doc:
+        raise falcon.HTTPBadRequest(
+            title="Not JSON", description="A valid JSON document is required."
+        )
+    raw_body = req.context.get("body_raw", b"")
+    raw_attachments = doc.get("attachments", [])
+    if raw_attachments is None:
+        raw_attachments = []
+    if raw_attachments and len(raw_body) > config.json_body_max_bytes:
+        raise falcon.HTTPBadRequest(
+            title="Request too large",
+            description="Attachment JSON request body exceeds the maximum size",
+        )
+    if not isinstance(raw_attachments, list):
+        raise falcon.HTTPBadRequest(
+            title="Invalid attachments",
+            description="attachments must be an array",
+        )
+    try:
+        uploads = [
+            decode_json_attachment(attachment, config)
+            for attachment in raw_attachments
+        ]
+    except AttachmentError as e:
+        raise falcon.HTTPBadRequest(
+            title="Invalid attachment", description=str(e)
+        )
+    doc.pop("attachments", None)
+    return doc, uploads
+
+
+def read_multipart_part_bytes(
+    part: Any, limit: int, limit_message: str = "Attachment exceeds maximum file size"
+) -> bytes:
+    stream = getattr(part, "stream", None)
+    try:
+        if stream is not None:
+            return read_limited_stream(stream, limit)
+        data = getattr(part, "data", None)
+        if data is None:
+            data = getattr(part, "text", "")
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if len(data) > limit:
+            raise AttachmentError()
+        return data
+    except AttachmentError:
+        raise AttachmentError(limit_message)
+
+
+def read_multipart_payload(part: Any, config: Any) -> str:
+    try:
+        data = read_multipart_part_bytes(part, config.json_body_max_bytes)
+    except AttachmentError:
+        raise falcon.HTTPBadRequest(
+            title="Request too large",
+            description="Attachment JSON request body exceeds the maximum size",
+        )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise falcon.HTTPBadRequest(
+            title="Malformed payload",
+            description="payload must be a valid UTF-8 JSON document",
+        )
+
+
+def parse_multipart_attachment_metadata(part: Any, config: Any) -> JsonObj:
+    payload = read_multipart_payload(part, config)
+    try:
+        metadata = json.loads(payload)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata must be a valid UTF-8 JSON document",
+        )
+    if not isinstance(metadata, dict):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata must be a JSON object",
+        )
+    disposition = metadata.get("disposition", "attachment")
+    if disposition == "":
+        disposition = "attachment"
+    content_id = metadata.get("content_id")
+    if not isinstance(disposition, str):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata disposition must be a string",
+        )
+    if content_id is not None and not isinstance(content_id, str):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata content_id must be a string",
+        )
+    return {
+        "disposition": disposition,
+        "content_id": content_id.strip().strip("<>") if content_id else None,
+    }
+
+
+def parse_multipart_send_request(
+    req: falcon.Request,
+    config: Any,
+) -> Tuple[JsonObj, List[AttachmentUpload]]:
+    payload = None
+    uploads = []
+    total_attachment_bytes = 0
+    pending_attachment_metadata = None
+    try:
+        media = req.get_media()
+        for part in media:
+            if part.name == "payload":
+                if payload is not None:
+                    raise falcon.HTTPBadRequest(
+                        title="Invalid multipart request",
+                        description="Only one payload field is allowed",
+                    )
+                payload = read_multipart_payload(part, config)
+                continue
+            if part.name == "attachment_metadata":
+                if pending_attachment_metadata is not None:
+                    raise falcon.HTTPBadRequest(
+                        title="Invalid multipart request",
+                        description="attachment_metadata must be followed by an attachment",
+                    )
+                pending_attachment_metadata = parse_multipart_attachment_metadata(
+                    part, config
+                )
+                continue
+            if part.name != "attachment":
+                raise falcon.HTTPBadRequest(
+                    title="Invalid multipart request",
+                    description=(
+                        "Only payload, attachment_metadata, and attachment fields "
+                        "are allowed"
+                    ),
+                )
+
+            if len(uploads) >= config.max_count:
+                raise AttachmentError("Too many attachments")
+            remaining_total = config.max_total_bytes - total_attachment_bytes
+            if remaining_total <= 0:
+                raise AttachmentError("Attachments exceed maximum total size")
+            filename = getattr(part, "filename", "") or ""
+            content_type = getattr(part, "content_type", "") or ""
+            data = read_multipart_part_bytes(
+                part,
+                min(config.max_file_bytes, remaining_total),
+                "Attachments exceed maximum total size",
+            )
+            total_attachment_bytes += len(data)
+            uploads.append(
+                AttachmentUpload(
+                    filename=filename,
+                    content_type=content_type,
+                    data=data,
+                    disposition=(
+                        pending_attachment_metadata or {}
+                    ).get("disposition", "attachment"),
+                    content_id=(pending_attachment_metadata or {}).get("content_id"),
+                )
+            )
+            pending_attachment_metadata = None
+    except falcon.HTTPError:
+        raise
+    except AttachmentError as e:
+        raise falcon.HTTPBadRequest(
+            title="Invalid attachment", description=str(e)
+        )
+    except Exception as e:
+        raise falcon.HTTPBadRequest(
+            title="Invalid multipart request", description=str(e)
+        )
+
+    if payload is None:
+        raise falcon.HTTPBadRequest(
+            title="Missing payload",
+            description="Multipart transactional sends require a payload field",
+        )
+    if pending_attachment_metadata is not None:
+        raise falcon.HTTPBadRequest(
+            title="Invalid multipart request",
+            description="attachment_metadata must be followed by an attachment",
+        )
+    try:
+        doc = json.loads(payload)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        raise falcon.HTTPBadRequest(
+            title="Malformed payload",
+            description="payload must be a valid UTF-8 JSON document",
+        )
+    if not isinstance(doc, dict):
+        raise falcon.HTTPBadRequest(
+            title="Malformed payload", description="payload must be a JSON object"
+        )
+    return doc, uploads
+
+
+def attachment_manifests_expired(
+    attachments: List[JsonObj],
+    now: datetime = None,
+) -> bool:
+    if now is None:
+        now = datetime.utcnow()
+    for attachment in attachments:
+        expires_at = attachment.get("expires_at")
+        if not expires_at:
+            return True
+        try:
+            expires_dt = (
+                dateutil.parser.parse(expires_at)
+                .astimezone(tzutc())
+                .replace(tzinfo=None)
+            )
+        except:
+            return True
+        if expires_dt <= now:
+            return True
+    return False
+
+
 class Send(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
@@ -459,11 +709,7 @@ class Send(object):
 
         db = req.context["db"]
 
-        doc = req.context.get("doc")
-        if not doc:
-            raise falcon.HTTPBadRequest(
-                title="Not JSON", description="A valid JSON document is required."
-            )
+        doc, attachment_uploads = parse_send_request(req)
 
         template = None
         if doc.get("template", ""):
@@ -566,11 +812,6 @@ class Send(object):
         txnmsgid, _ = parse_txnid(campid)
 
         bodykey = ""
-        if template is None:
-            bodyutf8 = doc["body"].encode("utf-8")
-            bodykey = "templates/txn/%s/%s.html" % (mycid, shortuuid.uuid())
-            s3_write(os.environ["s3_databucket"], bodykey, bodyutf8)
-
         _, addr = parseaddr(doc["to"])
         if "@" not in addr:
             raise falcon.HTTPBadRequest(
@@ -579,45 +820,108 @@ class Send(object):
             )
         domain = addr.split("@")[1]
 
-        db.execute(
-            "insert into txnqueue (cid, route, domain, data) values (%s, %s, %s, %s)",
-            mycid,
-            doc["route"],
-            domain,
-            {
-                "tag": tag,
-                "template": doc.get("template", ""),
-                "body": bodykey,
-                "variables": doc.get("variables", None),
-                "to": doc["to"],
-                "fromname": doc.get("fromname", ""),
-                "fromemail": doc.get("fromemail", ""),
-                "returnpath": doc.get("returnpath", ""),
-                "replyto": doc.get("replyto", ""),
-                "subject": doc["subject"],
-                "toname": doc.get("toname"),
-                "route": doc["route"],
-                "campid": campid,
-                "disableopens": txnsettings.get("disableopens", False),
-            },
-        )
-        db.execute(
-            "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
-            shortuuid.uuid(),
-            mycid,
-            datetime.utcnow(),
-            txnmsgid,
-            {
-                "event": "Injection",
-                "status": "Accepted",
-                "subject": doc["subject"],
-                "tag": tag,
-                "fromname": doc.get("fromname", ""),
-                "fromemail": doc.get("fromemail", "") or doc.get("returnpath", ""),
-                "toname": doc.get("toname"),
-                "to": doc["to"],
-            },
-        )
+        if attachment_uploads:
+            route = db.routes.get(doc["route"])
+            if route is None or "published" not in route:
+                raise falcon.HTTPForbidden()
+            backend_types = route_backend_types_for_recipient(db, route, addr.lower())
+            if not backend_types or backend_types != {"ses"}:
+                raise falcon.HTTPBadRequest(
+                    title="Unsupported postal route",
+                    description=(
+                        "Transactional attachments are only supported for routes "
+                        "that resolve exclusively to SES"
+                    ),
+                )
+            attachment_config = get_attachment_config()
+            try:
+                validate_attachment_collection(
+                    attachment_uploads,
+                    attachment_config,
+                    doc.get("body", ""),
+                )
+            except AttachmentError as e:
+                raise falcon.HTTPBadRequest(
+                    title="Invalid attachment", description=str(e)
+                )
+        else:
+            attachment_config = None
+
+        attachment_storage = None
+        attachment_manifests = []
+        try:
+            if template is None:
+                bodyutf8 = doc["body"].encode("utf-8")
+                bodykey = "templates/txn/%s/%s.html" % (mycid, shortuuid.uuid())
+                s3_write(os.environ["s3_databucket"], bodykey, bodyutf8)
+
+            if attachment_uploads:
+                attachment_storage = build_attachment_storage(attachment_config)
+                try:
+                    attachment_manifests = store_attachments(
+                        attachment_storage,
+                        attachment_config,
+                        mycid,
+                        txnmsgid,
+                        attachment_uploads,
+                        doc.get("body", ""),
+                    )
+                except AttachmentError as e:
+                    raise falcon.HTTPBadRequest(
+                        title="Invalid attachment", description=str(e)
+                    )
+                log.info(
+                    "accepted %s transactional attachments for cid=%s msgid=%s",
+                    len(attachment_manifests),
+                    mycid,
+                    txnmsgid,
+                )
+
+            db.execute(
+                "insert into txnqueue (cid, route, domain, data) values (%s, %s, %s, %s)",
+                mycid,
+                doc["route"],
+                domain,
+                {
+                    "tag": tag,
+                    "template": doc.get("template", ""),
+                    "body": bodykey,
+                    "variables": doc.get("variables", None),
+                    "to": doc["to"],
+                    "fromname": doc.get("fromname", ""),
+                    "fromemail": doc.get("fromemail", ""),
+                    "returnpath": doc.get("returnpath", ""),
+                    "replyto": doc.get("replyto", ""),
+                    "subject": doc["subject"],
+                    "toname": doc.get("toname"),
+                    "route": doc["route"],
+                    "campid": campid,
+                    "disableopens": txnsettings.get("disableopens", False),
+                    "attachments": attachment_manifests,
+                },
+            )
+            db.execute(
+                "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+                shortuuid.uuid(),
+                mycid,
+                datetime.utcnow(),
+                txnmsgid,
+                {
+                    "event": "Injection",
+                    "status": "Accepted",
+                    "subject": doc["subject"],
+                    "tag": tag,
+                    "fromname": doc.get("fromname", ""),
+                    "fromemail": doc.get("fromemail", "")
+                    or doc.get("returnpath", ""),
+                    "toname": doc.get("toname"),
+                    "to": doc["to"],
+                },
+            )
+        except Exception:
+            if attachment_storage is not None and attachment_manifests:
+                delete_attachments(attachment_storage, attachment_manifests)
+            raise
 
         req.context["result"] = {"tag": tag, "to": doc["to"], "result": "ok"}
 
@@ -627,6 +931,7 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
     with open_db() as db:
         mycid = None
         txnmsgid = None
+        attachment_manifests = data.get("attachments") or []
 
         try:
             campid = data.get("campid")
@@ -660,6 +965,16 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
             route = db.routes.get(data["route"])
             if route is None or "published" not in route:
                 raise Exception("Route not found")
+
+            if attachment_manifests and attachment_manifests_expired(
+                attachment_manifests
+            ):
+                log.warning(
+                    "rejecting transactional message with expired attachments cid=%s campid=%s",
+                    mycid,
+                    campid,
+                )
+                raise Exception("Transactional attachments expired before send")
 
             if variables is not None and bodytemplate.get("type") == "raw":
                 try:
@@ -773,6 +1088,7 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                 subject,
                 campid=campid,
                 toname=data["toname"],
+                attachments=attachment_manifests,
                 raise_err=True,
             )
 
@@ -810,6 +1126,15 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
                     )
                 except:
                     log.exception("error")
+        finally:
+            if attachment_manifests:
+                try:
+                    delete_attachments(
+                        build_attachment_storage(get_attachment_config()),
+                        attachment_manifests,
+                    )
+                except:
+                    log.exception("error cleaning up transactional attachments")
 
 
 @tasks.task(priority=HIGH_PRIORITY)
@@ -1061,6 +1386,7 @@ class RecentTags(object):
 
 
 CHECK_TXNS_LOCK = 38660663
+TXN_ATTACHMENT_CLEANUP_LOCK = 38660664
 
 
 def check_txns() -> None:
@@ -1125,6 +1451,74 @@ def check_txns() -> None:
                                     run_task(send_txn, company, data)
                     except:
                         log.exception("error")
+        except:
+            log.exception("error")
+
+
+def cleanup_expired_txn_attachments() -> None:
+    with open_db() as db:
+        try:
+            with db.transaction():
+                if not db.single(
+                    f"select pg_try_advisory_xact_lock({TXN_ATTACHMENT_CLEANUP_LOCK})"
+                ):
+                    return
+
+                now = datetime.utcnow()
+                for rowid, cid, data in list(
+                    db.execute(
+                        """
+                    select id, cid, data from txnqueue
+                    where data->'attachments' is not null
+                """
+                    )
+                ):
+                    attachments = data.get("attachments") or []
+                    if not attachments:
+                        continue
+
+                    if not attachment_manifests_expired(attachments, now):
+                        continue
+
+                    delete_attachments(
+                        build_attachment_storage(get_attachment_config()),
+                        attachments,
+                    )
+                    bodykey = data.get("body")
+                    if bodykey:
+                        try:
+                            s3_delete(os.environ["s3_databucket"], bodykey)
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            log.exception(
+                                "error deleting expired transactional body %s",
+                                bodykey,
+                            )
+                    db.execute(
+                        "delete from txnqueue where cid = %s and id = %s",
+                        cid,
+                        rowid,
+                    )
+                    campid = data.get("campid")
+                    txnmsgid = None
+                    if campid is not None:
+                        txnmsgid, _ = parse_txnid(campid)
+                    data["event"] = "Error"
+                    data["error"] = "Transactional attachments expired before send"
+                    db.execute(
+                        "insert into txnsends (id, cid, ts, msgid, data) values (%s, %s, %s, %s, %s)",
+                        shortuuid.uuid(),
+                        cid,
+                        datetime.utcnow(),
+                        txnmsgid,
+                        data,
+                    )
+                    log.info(
+                        "expired transactional attachments for cid=%s queue_id=%s",
+                        cid,
+                        rowid,
+                    )
         except:
             log.exception("error")
 

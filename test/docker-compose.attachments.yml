@@ -1,0 +1,49 @@
+services:
+  api:
+    ports:
+      - "127.0.0.1:18080:8000"
+    environment:
+      - development=true
+      - attachment_enabled=true
+      - attachment_storage_backend=s3
+      - attachment_s3_bucket=${EDCOM_ATTACHMENT_TEST_BUCKET}
+      - attachment_s3_prefix=${EDCOM_ATTACHMENT_TEST_PREFIX:-attachments/txn/integration/}
+      - attachment_s3_region=${EDCOM_ATTACHMENT_TEST_REGION:-${EDCOM_SES_REGION}}
+      - attachment_s3_access_key=${EDCOM_SES_ACCESS_KEY_ID}
+      - attachment_s3_secret_key=${EDCOM_SES_SECRET_ACCESS_KEY}
+      - attachment_s3_endpoint_url=${EDCOM_ATTACHMENT_TEST_ENDPOINT_URL:-}
+      - attachment_manage_lifecycle=true
+      - attachment_ttl_hours=24
+      - attachment_lifecycle_expiration_days=2
+      - attachment_lifecycle_abort_multipart_days=1
+      - attachment_max_count=5
+      - attachment_max_file_bytes=10485760
+      - attachment_max_total_bytes=20971520
+      - attachment_max_mime_bytes=31457280
+      - attachment_json_body_max_bytes=33554432
+      - EDCOM_TEST_FROM_EMAIL=${EDCOM_TEST_FROM_EMAIL}
+      - EDCOM_SES_DOMAIN=${EDCOM_SES_DOMAIN:-}
+      - EDCOM_SES_REGION=${EDCOM_SES_REGION}
+      - EDCOM_SES_ACCESS_KEY_ID=${EDCOM_SES_ACCESS_KEY_ID}
+      - EDCOM_SES_SECRET_ACCESS_KEY=${EDCOM_SES_SECRET_ACCESS_KEY}
+      - PYTHONPATH=/
+    command: >
+      sh -c '/scripts/run_db_migrations.py &&
+             cd /test &&
+             ./setup.py &&
+             /scripts/seed_transactional_attachment_integration.py > /tmp/edcom-attachment-integration.env &&
+             cat /tmp/edcom-attachment-integration.env &&
+             /usr/bin/env gunicorn --bind 0.0.0.0:8000 -t 300000 -w 1 api.app'
+
+  smtprelay:
+    image: edcom/smtprelay-dev
+    platform: linux/arm64/v8
+    container_name: edcom-smtprelay-attachment-test
+    build:
+      context: ../smtprelay
+    depends_on:
+      - api
+    volumes:
+      - "./smtpcert:/cert"
+    ports:
+      - "127.0.0.1:1587:587"
