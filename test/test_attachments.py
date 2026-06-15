@@ -1,4 +1,5 @@
 import base64
+from datetime import datetime
 from email.parser import BytesParser
 from email.policy import default
 import json
@@ -11,12 +12,16 @@ try:
     import falcon
     from falcon import testing
     from api.shared.send import do_ses_send_task, possible_backend_types
-    from api.transactional import parse_multipart_send_request
+    from api.transactional import (
+        attachment_manifests_expired,
+        parse_multipart_send_request,
+    )
 except ModuleNotFoundError:
     falcon = None
     testing = None
     do_ses_send_task = None
     possible_backend_types = None
+    attachment_manifests_expired = None
     parse_multipart_send_request = None
 
 from api.shared.attachments import (
@@ -167,6 +172,52 @@ class TestAttachments(unittest.TestCase):
                 },
                 config(),
             )
+
+    def test_rejects_non_string_json_attachment_fields(self):
+        for field in ["filename", "content_type", "disposition", "content_id"]:
+            item = {
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "content": base64.b64encode(b"%PDF-1.7\n").decode("ascii"),
+            }
+            item[field] = 123
+            with self.subTest(field=field):
+                with self.assertRaises(AttachmentError):
+                    decode_json_attachment(item, config())
+
+    def test_json_attachment_allows_nullable_content_id(self):
+        upload = decode_json_attachment(
+            {
+                "filename": "invoice.pdf",
+                "content_type": "application/pdf",
+                "content": base64.b64encode(b"%PDF-1.7\n").decode("ascii"),
+                "content_id": None,
+            },
+            config(),
+        )
+
+        self.assertIsNone(upload.content_id)
+
+    @unittest.skipIf(attachment_manifests_expired is None, "falcon is not installed")
+    def test_attachment_manifests_expired_rejects_past_or_invalid_ttl(self):
+        self.assertTrue(
+            attachment_manifests_expired(
+                [{"expires_at": "2026-06-14T00:00:00Z"}],
+                now=datetime(2026, 6, 14, 1, 0, 0),
+            )
+        )
+        self.assertTrue(
+            attachment_manifests_expired(
+                [{"expires_at": "not-a-timestamp"}],
+                now=datetime(2026, 6, 14, 1, 0, 0),
+            )
+        )
+        self.assertFalse(
+            attachment_manifests_expired(
+                [{"expires_at": "2026-06-14T02:00:00Z"}],
+                now=datetime(2026, 6, 14, 1, 0, 0),
+            )
+        )
 
     def test_local_storage_manifest_and_cleanup(self):
         with tempfile.TemporaryDirectory() as root:

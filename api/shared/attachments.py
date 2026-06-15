@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.policy import SMTP
 from io import BytesIO
-from typing import BinaryIO, Dict, Iterator, List, Protocol, TypedDict
+from typing import BinaryIO, Dict, Iterator, List, Optional, Protocol, TypedDict
 
 log = logging.getLogger(__name__)
 ATTACHMENT_LIFECYCLE_RULE_ID = "edcom-transactional-attachment-expiration"
@@ -791,6 +791,22 @@ def build_raw_mime_message(
     return msg.as_bytes()
 
 
+def json_attachment_string(
+    item: Dict[str, str],
+    field: str,
+    default: Optional[str] = "",
+    allow_null: bool = False,
+) -> Optional[str]:
+    if field not in item:
+        return default
+    value = item[field]
+    if value is None and allow_null:
+        return None
+    if not isinstance(value, str):
+        raise AttachmentError("Attachment %s must be a string" % field)
+    return value
+
+
 def decode_json_attachment(item: Dict[str, str], config: AttachmentConfig) -> AttachmentUpload:
     if not isinstance(item, dict):
         raise AttachmentError("Attachment must be a JSON object")
@@ -804,11 +820,14 @@ def decode_json_attachment(item: Dict[str, str], config: AttachmentConfig) -> At
     if len(data) > config.max_file_bytes:
         raise AttachmentError("Attachment exceeds maximum file size")
     return AttachmentUpload(
-        filename=item.get("filename", ""),
-        content_type=item.get("content_type", ""),
+        filename=json_attachment_string(item, "filename", ""),
+        content_type=json_attachment_string(item, "content_type", ""),
         data=data,
-        disposition=item.get("disposition", "attachment") or "attachment",
-        content_id=item.get("content_id") or None,
+        disposition=(
+            json_attachment_string(item, "disposition", "attachment")
+            or "attachment"
+        ),
+        content_id=json_attachment_string(item, "content_id", None, allow_null=True),
     )
 
 

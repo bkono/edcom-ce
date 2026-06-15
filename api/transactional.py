@@ -675,6 +675,29 @@ def parse_multipart_send_request(
     return doc, uploads
 
 
+def attachment_manifests_expired(
+    attachments: List[JsonObj],
+    now: datetime = None,
+) -> bool:
+    if now is None:
+        now = datetime.utcnow()
+    for attachment in attachments:
+        expires_at = attachment.get("expires_at")
+        if not expires_at:
+            return True
+        try:
+            expires_dt = (
+                dateutil.parser.parse(expires_at)
+                .astimezone(tzutc())
+                .replace(tzinfo=None)
+            )
+        except:
+            return True
+        if expires_dt <= now:
+            return True
+    return False
+
+
 class Send(object):
 
     def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
@@ -938,6 +961,16 @@ def send_txn(company: JsonObj, data: JsonObj) -> None:
             route = db.routes.get(data["route"])
             if route is None or "published" not in route:
                 raise Exception("Route not found")
+
+            if attachment_manifests and attachment_manifests_expired(
+                attachment_manifests
+            ):
+                log.warning(
+                    "rejecting transactional message with expired attachments cid=%s campid=%s",
+                    mycid,
+                    campid,
+                )
+                raise Exception("Transactional attachments expired before send")
 
             if variables is not None and bodytemplate.get("type") == "raw":
                 try:
@@ -1440,26 +1473,7 @@ def cleanup_expired_txn_attachments() -> None:
                     if not attachments:
                         continue
 
-                    expired = False
-                    for attachment in attachments:
-                        expires_at = attachment.get("expires_at")
-                        if not expires_at:
-                            expired = True
-                            break
-                        try:
-                            expires_dt = (
-                                dateutil.parser.parse(expires_at)
-                                .astimezone(tzutc())
-                                .replace(tzinfo=None)
-                            )
-                        except:
-                            expired = True
-                            break
-                        if expires_dt <= now:
-                            expired = True
-                            break
-
-                    if not expired:
+                    if not attachment_manifests_expired(attachments, now):
                         continue
 
                     delete_attachments(
