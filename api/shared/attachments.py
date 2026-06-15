@@ -794,8 +794,11 @@ def build_raw_mime_message(
 def decode_json_attachment(item: Dict[str, str], config: AttachmentConfig) -> AttachmentUpload:
     if not isinstance(item, dict):
         raise AttachmentError("Attachment must be a JSON object")
+    content = item.get("content", "")
+    if not isinstance(content, str):
+        raise AttachmentError("Attachment content must be valid base64")
     try:
-        data = base64.b64decode(item.get("content", ""), validate=True)
+        data = base64.b64decode(content, validate=True)
     except (binascii.Error, ValueError):
         raise AttachmentError("Attachment content must be valid base64")
     if len(data) > config.max_file_bytes:

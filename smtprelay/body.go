@@ -16,9 +16,11 @@ import (
 )
 
 type Attachment struct {
-	Filename    string
-	ContentType string
-	Data        []byte
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Data        []byte `json:"-"`
+	Disposition string `json:"disposition,omitempty"`
+	ContentID   string `json:"content_id,omitempty"`
 }
 
 type extractedMessage struct {
@@ -206,10 +208,19 @@ func parseMultipartMessage(body []byte, boundary string) (extractedMessage, erro
 			if err != nil {
 				return extractedMessage{}, err
 			}
+			disposition := "attachment"
+			if dispositionHeader := p.Header.Get("Content-Disposition"); dispositionHeader != "" {
+				if dispositionType, _, err := mime.ParseMediaType(dispositionHeader); err == nil && strings.ToLower(dispositionType) == "inline" {
+					disposition = "inline"
+				}
+			}
+			contentID := strings.Trim(p.Header.Get("Content-ID"), "<>")
 			msg.Attachments = append(msg.Attachments, Attachment{
 				Filename:    filename,
 				ContentType: mediaType,
 				Data:        decodedBody,
+				Disposition: disposition,
+				ContentID:   contentID,
 			})
 			continue
 		}

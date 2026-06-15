@@ -545,6 +545,38 @@ def read_multipart_payload(part: Any, config: Any) -> str:
         )
 
 
+def parse_multipart_attachment_metadata(part: Any, config: Any) -> JsonObj:
+    payload = read_multipart_payload(part, config)
+    try:
+        metadata = json.loads(payload)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata must be a valid UTF-8 JSON document",
+        )
+    if not isinstance(metadata, dict):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata must be a JSON object",
+        )
+    disposition = metadata.get("disposition", "attachment") or "attachment"
+    content_id = metadata.get("content_id") or None
+    if not isinstance(disposition, str):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata disposition must be a string",
+        )
+    if content_id is not None and not isinstance(content_id, str):
+        raise falcon.HTTPBadRequest(
+            title="Malformed attachment metadata",
+            description="attachment_metadata content_id must be a string",
+        )
+    return {
+        "disposition": disposition,
+        "content_id": content_id.strip("<>") if content_id else None,
+    }
+
+
 def parse_multipart_send_request(
     req: falcon.Request,
     config: Any,
@@ -552,6 +584,7 @@ def parse_multipart_send_request(
     payload = None
     uploads = []
     total_attachment_bytes = 0
+    pending_attachment_metadata = None
     try:
         media = req.get_media()
         for part in media:
@@ -563,10 +596,23 @@ def parse_multipart_send_request(
                     )
                 payload = read_multipart_payload(part, config)
                 continue
+            if part.name == "attachment_metadata":
+                if pending_attachment_metadata is not None:
+                    raise falcon.HTTPBadRequest(
+                        title="Invalid multipart request",
+                        description="attachment_metadata must be followed by an attachment",
+                    )
+                pending_attachment_metadata = parse_multipart_attachment_metadata(
+                    part, config
+                )
+                continue
             if part.name != "attachment":
                 raise falcon.HTTPBadRequest(
                     title="Invalid multipart request",
-                    description="Only payload and attachment fields are allowed",
+                    description=(
+                        "Only payload, attachment_metadata, and attachment fields "
+                        "are allowed"
+                    ),
                 )
 
             if len(uploads) >= config.max_count:
@@ -587,8 +633,13 @@ def parse_multipart_send_request(
                     filename=filename,
                     content_type=content_type,
                     data=data,
+                    disposition=(
+                        pending_attachment_metadata or {}
+                    ).get("disposition", "attachment"),
+                    content_id=(pending_attachment_metadata or {}).get("content_id"),
                 )
             )
+            pending_attachment_metadata = None
     except falcon.HTTPError:
         raise
     except AttachmentError as e:
@@ -604,6 +655,11 @@ def parse_multipart_send_request(
         raise falcon.HTTPBadRequest(
             title="Missing payload",
             description="Multipart transactional sends require a payload field",
+        )
+    if pending_attachment_metadata is not None:
+        raise falcon.HTTPBadRequest(
+            title="Invalid multipart request",
+            description="attachment_metadata must be followed by an attachment",
         )
     try:
         doc = json.loads(payload)
@@ -1410,6 +1466,17 @@ def cleanup_expired_txn_attachments() -> None:
                         build_attachment_storage(get_attachment_config()),
                         attachments,
                     )
+                    bodykey = data.get("body")
+                    if bodykey:
+                        try:
+                            s3_delete(os.environ["s3_databucket"], bodykey)
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            log.exception(
+                                "error deleting expired transactional body %s",
+                                bodykey,
+                            )
                     db.execute(
                         "delete from txnqueue where cid = %s and id = %s",
                         cid,

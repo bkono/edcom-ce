@@ -227,6 +227,14 @@ func buildAPIRequest(apikey string, msg SendMailMsg, attachments []Attachment) (
 	}
 
 	for _, attachment := range attachments {
+		metadata, err := json.Marshal(attachment)
+		if err != nil {
+			return nil, err
+		}
+		if err := writer.WriteField("attachment_metadata", string(metadata)); err != nil {
+			return nil, err
+		}
+
 		header := make(textproto.MIMEHeader)
 		header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{
 			"name":     "attachment",

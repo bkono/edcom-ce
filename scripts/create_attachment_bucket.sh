@@ -90,6 +90,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_command aws
+require_command jq
 
 if [[ -z "$bucket" ]]; then
     die "EDCOM_ATTACHMENT_BUCKET or EDCOM_ATTACHMENT_TEST_BUCKET is required"
@@ -175,31 +176,46 @@ aws "${aws_args[@]}" s3api put-bucket-encryption \
     }'
 
 lifecycle_file="$(mktemp)"
+existing_lifecycle_file="$(mktemp)"
+lifecycle_rule_file="$(mktemp)"
+lifecycle_error_file="$(mktemp)"
 cleanup() {
-    rm -f "$lifecycle_file"
+    rm -f "$lifecycle_file" "$existing_lifecycle_file" "$lifecycle_rule_file" "$lifecycle_error_file"
 }
 trap cleanup EXIT
 
 escaped_prefix="$(json_escape "$prefix")"
-cat > "$lifecycle_file" <<JSON
+cat > "$lifecycle_rule_file" <<JSON
 {
-  "Rules": [
-    {
-      "ID": "edcom-transactional-attachment-expiration",
-      "Status": "Enabled",
-      "Filter": {
-        "Prefix": "$escaped_prefix"
-      },
-      "Expiration": {
-        "Days": $expiration_days
-      },
-      "AbortIncompleteMultipartUpload": {
-        "DaysAfterInitiation": $abort_multipart_days
-      }
-    }
-  ]
+  "ID": "edcom-transactional-attachment-expiration",
+  "Status": "Enabled",
+  "Filter": {
+    "Prefix": "$escaped_prefix"
+  },
+  "Expiration": {
+    "Days": $expiration_days
+  },
+  "AbortIncompleteMultipartUpload": {
+    "DaysAfterInitiation": $abort_multipart_days
+  }
 }
 JSON
+
+if aws "${aws_args[@]}" s3api get-bucket-lifecycle-configuration \
+    --bucket "$bucket" > "$existing_lifecycle_file" 2> "$lifecycle_error_file"; then
+    :
+elif grep -q "NoSuchLifecycleConfiguration" "$lifecycle_error_file"; then
+    printf '{"Rules":[]}\n' > "$existing_lifecycle_file"
+else
+    cat "$lifecycle_error_file" >&2
+    exit 1
+fi
+
+jq --slurpfile rule "$lifecycle_rule_file" '
+  .Rules = ((.Rules // [])
+    | map(select(.ID != "edcom-transactional-attachment-expiration"))
+    + [$rule[0]])
+' "$existing_lifecycle_file" > "$lifecycle_file"
 
 echo "Configuring lifecycle..."
 aws "${aws_args[@]}" s3api put-bucket-lifecycle-configuration \

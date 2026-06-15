@@ -157,6 +157,17 @@ class TestAttachments(unittest.TestCase):
         with self.assertRaises(AttachmentError):
             decode_json_attachment(None, config())
 
+    def test_rejects_non_string_json_attachment_content(self):
+        with self.assertRaises(AttachmentError):
+            decode_json_attachment(
+                {
+                    "filename": "invoice.pdf",
+                    "content_type": "application/pdf",
+                    "content": None,
+                },
+                config(),
+            )
+
     def test_local_storage_manifest_and_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = config(local_path=root)
@@ -339,6 +350,69 @@ class TestAttachments(unittest.TestCase):
                 "filename": "invoice.pdf",
                 "content_type": "application/pdf",
                 "size": 9,
+            },
+        )
+
+    @unittest.skipIf(falcon is None, "falcon is not installed")
+    def test_parses_multipart_attachment_metadata(self):
+        boundary = "edcom-test-boundary"
+        payload = {
+            "to": "customer@example.com",
+            "fromemail": "billing@example.com",
+            "subject": "Invoice",
+            "body": "<p><img src=\"cid:logo\"></p>",
+        }
+        metadata = {"disposition": "inline", "content_id": "<logo>"}
+        body = b"".join(
+            [
+                multipart_field(
+                    boundary,
+                    "payload",
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_field(
+                    boundary,
+                    "attachment_metadata",
+                    json.dumps(metadata).encode("utf-8"),
+                    "application/json",
+                ),
+                multipart_file(
+                    boundary,
+                    "attachment",
+                    "logo.png",
+                    "image/png",
+                    b"\x89PNG\r\n\x1a\n",
+                ),
+                ("--%s--\r\n" % boundary).encode("utf-8"),
+            ]
+        )
+
+        class Resource:
+            def on_post(self, req, resp):
+                doc, uploads = parse_multipart_send_request(req, config())
+                resp.media = {
+                    "subject": doc["subject"],
+                    "disposition": uploads[0].disposition,
+                    "content_id": uploads[0].content_id,
+                }
+
+        app = falcon.App()
+        app.add_route("/send", Resource())
+        client = testing.TestClient(app)
+        resp = client.simulate_post(
+            "/send",
+            body=body,
+            headers={"content-type": "multipart/form-data; boundary=%s" % boundary},
+        )
+
+        self.assertEqual(resp.status, "200 OK")
+        self.assertEqual(
+            resp.json,
+            {
+                "subject": "Invoice",
+                "disposition": "inline",
+                "content_id": "logo",
             },
         )
 

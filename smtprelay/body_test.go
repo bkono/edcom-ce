@@ -1,6 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
+	"mime"
+	"mime/multipart"
 	"strings"
 	"testing"
 )
@@ -45,6 +49,89 @@ JVBERi0xLjcK
 	}
 	if string(attachment.Data) != "%PDF-1.7\n" {
 		t.Fatalf("unexpected attachment data: %q", string(attachment.Data))
+	}
+}
+
+func TestExtractMessagePreservesInlineAttachmentMetadata(t *testing.T) {
+	body := strings.ReplaceAll(`--boundary
+Content-Type: text/html; charset=utf-8
+
+<p><img src="cid:logo"></p>
+--boundary
+Content-Type: image/png; name="logo.png"
+Content-Disposition: inline; filename="logo.png"
+Content-ID: <logo>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgo=
+--boundary--`, "\n", "\r\n")
+
+	msg, err := extractMessage([]byte(body), `multipart/related; boundary="boundary"`, "")
+	if err != nil {
+		t.Fatalf("extractMessage returned error: %s", err)
+	}
+	if len(msg.Attachments) != 1 {
+		t.Fatalf("expected one attachment, got %d", len(msg.Attachments))
+	}
+	attachment := msg.Attachments[0]
+	if attachment.Disposition != "inline" {
+		t.Fatalf("expected inline disposition, got %q", attachment.Disposition)
+	}
+	if attachment.ContentID != "logo" {
+		t.Fatalf("expected logo content id, got %q", attachment.ContentID)
+	}
+}
+
+func TestBuildAPIRequestForwardsAttachmentMetadata(t *testing.T) {
+	t.Setenv("edcomhost", "127.0.0.1")
+
+	req, err := buildAPIRequest(
+		"apikey",
+		SendMailMsg{To: "customer@example.com", FromEmail: "from@example.com", Subject: "Subject", Body: "<p>Body</p>"},
+		[]Attachment{
+			{
+				Filename:    "logo.png",
+				ContentType: "image/png",
+				Data:        []byte("png"),
+				Disposition: "inline",
+				ContentID:   "logo",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("buildAPIRequest returned error: %s", err)
+	}
+
+	_, params, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	if err != nil {
+		t.Fatalf("could not parse content type: %s", err)
+	}
+	reader := multipart.NewReader(req.Body, params["boundary"])
+	var metadata Attachment
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("could not read multipart part: %s", err)
+		}
+		if part.FormName() != "attachment_metadata" {
+			continue
+		}
+		data, err := io.ReadAll(part)
+		if err != nil {
+			t.Fatalf("could not read metadata part: %s", err)
+		}
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			t.Fatalf("could not decode metadata: %s", err)
+		}
+	}
+	if metadata.Disposition != "inline" {
+		t.Fatalf("expected inline disposition, got %q", metadata.Disposition)
+	}
+	if metadata.ContentID != "logo" {
+		t.Fatalf("expected logo content id, got %q", metadata.ContentID)
 	}
 }
 
